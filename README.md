@@ -18,17 +18,25 @@ auto-disenchant panel for new loot.
 | **Auto-disenchant new loot** | off | Replaces the Enchanting mod's auto-disenchant for crafting rewards and other drops. Same half-XP behavior as the original. |
 | **Disenchant the bank** | off | Disenchants all unlocked enchanted bank stacks at or below a chosen grade. **Spends the item stacks you selected by grade.** |
 | **Bank disenchant mode** | skill | `Use the skill` gives full XP and uses the Enchanting action slot. `Instant` gives half XP and does not use the action slot. |
-| **Enchant until** | manual start | Enchants one selected item, or every eligible unlocked bank item, up to the target grade. **Spends the item plus essence costs until the target or essence floor stops it.** |
-| **Keep essence above** | 0 | Hard floor for enchanting costs; the next enchant is refused if any essence would drop below this. |
-| **Reroll until** | manual start | Rerolls one selected enchanted item until every selected modifier appears. **Spends grade essence up to the reroll cap.** |
-| **Reroll cap** | 500 | Maximum attempts for a reroll job. |
+| **Task queue** | empty | Enchant and reroll jobs are queued per item: pick an item, set the goal, press **Add**. **Start queue** works through them in order, one at a time. |
+| **Keep essence above** | 0 | Hard floor across every task; a task fails rather than take an essence below this. |
+| **Reroll cap** | 500 | How many rerolls a single task may pay for before giving up. |
 
-Locked items are always skipped. Only one bank job runs at a time, and every spending job is
-started by hand from the panel.
+Locked items are always skipped. Only one job runs at a time — the bank sweep and the queue both
+want the skill's action slot — and every job that spends is started by hand from the panel.
 
 ## How It Works
 
 Controls live in a panel on the Enchanting page, just under the XP bars.
+
+**The queue.** An enchant or a reroll is a *task*: an item plus a goal ("up to Epic", "until it
+has Increased Global Accuracy"). Adding one puts it in a list, and **Start queue** runs the list
+top to bottom, marking each task done or failed with the reason. A task that fails — the item was
+locked, the essence ran out, you asked for three modifiers on a two-slot item — doesn't stop the
+rest of the queue. **Clear finished** tidies up.
+
+Item dropdowns list everything eligible in the bank, alphabetically, with live quantities: they
+refresh as you enchant and disenchant.
 
 Auto Enchanting takes over the Enchanting mod's six native auto-disenchant fields while the
 master switch is enabled, remembers their old values, forces the native feature off, and hides
@@ -48,7 +56,10 @@ the newly created item object to the next grade, instead of letting the Enchanti
 rerunning on the same selected item.
 
 Rerolling reimplements the Enchanting mod's instant reroll path with an explicit modifier slot,
-because the original `executeReroll()` reads the slot from a DOM radio button.
+because the original `executeReroll()` reads the slot from a DOM radio button. It only ever
+rerolls a slot holding a modifier you *didn't* ask for, and a reroll can't hand back a modifier
+the item already has — so the ones you wanted are never at risk. A partial ask is fine: name one
+modifier on a three-slot item and the task is done the moment that one appears.
 
 ## Install
 
@@ -56,8 +67,14 @@ because the original `executeReroll()` reads the slot from a DOM radio button.
 archive root).
 
 **As a local mod:** create a local mod in the Melvor Mod Manager and point it at the `mod/`
-folder. For settings/storage persistence, Melvor's modding wiki says local mods loaded through
-the Creator Toolkit must also be linked to mod.io and subscribed/installed through mod.io.
+folder.
+
+> **Settings will not persist for an unlinked local mod.** Melvor's wiki says this of both Mod
+> Settings and character storage: *"When loading your mod as a Local Mod via the Creator Toolkit,
+> the mod must be linked to mod.io and you must have subscribed to and installed the mod via
+> mod.io in order for this data to persist."* Nothing is saved until you do — no amount of code
+> here can change that. The mod says so in the console at load; run `autoEnchanting.check()` to
+> see for yourself.
 
 Then enable it alongside the Enchanting mod and load a character.
 
@@ -79,13 +96,21 @@ Things worth knowing before changing this:
 - **Do not use speculative `getObjectByID()` lookups for stale `enchanting:` ids.** The
   Enchanting mod can fabricate and register dummy objects for unresolved ids. Resolve saved ids
   by scanning existing `allObjects` or bank items.
-- **The master switch lives in Mod Settings.** The wiki says Mod Settings are saved per
-  character in the character's save file, so `enabled` is not duplicated into
-  `characterStorage`.
-- **Panel-only settings live in per-character `characterStorage["settings"]`.** The storage
-  handle is taken from the `onCharacterLoaded`/`onInterfaceReady` callback context because the
-  wiki says character storage is not available until a character has loaded. `saveSettings()`
-  schedules a game save so changes survive a reload before the next autosave.
+- **All settings, `enabled` included, live in per-character `characterStorage["settings"]`.** The
+  Mod Settings switch is a *mirror*, pushed back with `.set()` on character load so it can't show
+  you the previous character's state — the same arrangement auto-sailing uses. `characterStorage`
+  is the single source of truth, so the two cannot fight.
+- **Take the storage handle in `setup()`, not in `onCharacterLoaded`.** The object exists from
+  setup; only its *contents* need a loaded character. A mod reloaded into an already-running game
+  never gets that hook, and every `setItem` then silently no-ops.
+- **`saveSettings()` must call `game.scheduleSave()`.** `characterStorage` only reaches the save
+  file when the game next saves, so without it a toggle followed by a reload is simply lost. It
+  also tolerates a JSON *string* coming back on read: spreading a string yields numeric keys and
+  leaves every real setting at its default, which looks exactly like "settings didn't save".
+- **`Bank.filterItems(pred)` hands `pred` a BankItem.** What it *returns* is the plain Item — that
+  is how the Enchanting mod itself uses it — but bank-entry records have been reported coming
+  back instead. `unwrap()` copes with either, keyed on `.quantity`, because an enchanted item
+  also has an `.item` (its base) and the two would otherwise be indistinguishable.
 - The `probes/` directory holds console scripts used to confirm the skill object graph at
   runtime. Paste them into the browser console with the Enchanting page open.
 

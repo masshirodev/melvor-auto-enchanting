@@ -1,7 +1,8 @@
 // Auto Enchanting
-// Bulk operations for the Enchanting mod: disenchant your bank by grade, enchant items up to
-// a target grade, and reroll an item until it has the modifiers you want. Also takes over the
-// Enchanting mod's auto-disenchant of new loot, so every option lives in one place.
+// Bulk operations for the Enchanting mod: disenchant your bank by grade, and queue up per-item
+// jobs — enchant this one to Epic, reroll that one until it has the modifiers you want — then
+// let it work through the list. Also takes over the Enchanting mod's auto-disenchant of new
+// loot, so every option lives in one place.
 //
 // Hooks the real Enchanting structures (confirmed at runtime, see probes/probe1.js):
 //   game.enchanting                     -> the Enchanting skill instance (class Enchanting extends Skill)
@@ -29,6 +30,9 @@
 //   * Its auto-disenchant is not a setting — it is six fields on the skill, saved inside the
 //     Enchanting skill's own save blob. We snapshot them, force them off, and reimplement the
 //     behaviour on our own settings (see the Loot takeover section).
+//
+// An enchant or a reroll replaces the item with a brand-new object, so a queued task follows
+// the item it made rather than the id you picked. See onEnchantActionDone() and rerollSlot().
 
 const VERSION = "0.1.2";
 const TAG = `[Auto Enchanting v${VERSION}]`;
@@ -44,6 +48,9 @@ const MAX_QUALITY = 5;
 const OFF = -1;
 
 const STORAGE_KEY = "settings";
+// Melvor gives each mod 8kb of character storage. Going over does not throw — it just doesn't
+// save — so we check before writing rather than wondering later.
+const STORAGE_LIMIT = 8192;
 const DRIVER_MS = 200; // how often a running job re-decides what to do next
 const INSTANT_BATCH = 25; // instant disenchants per driver tick, so a big bank can't stall a frame
 const REROLL_BATCH = 20; // rerolls per driver tick (each one is instant)
@@ -62,14 +69,19 @@ const DEFAULTS = {
   // What those six fields were set to before we took them over, so we can put them back.
   nativeBackup: null,
 
-  // Bank jobs. Every one of these spends, so they all start idle and are run by hand.
+  // Bank sweep.
   bankDisenchantGrade: OFF,
   bankDisenchantMode: "skill", // "skill" = full XP, uses the skill | "instant" = half XP, does not
-  enchantTarget: 1,
-  enchantScope: "single", // "single" = the picked item | "all" = every eligible bank item
-  essenceFloor: 0, // never spend an essence below this quantity
-  rerollTargetModIDs: [],
-  rerollMax: 500,
+
+  // The task queue: one entry per item you want enchanted or rerolled.
+  // { id, kind: "enchant" | "reroll", itemID, itemName, target?, modIDs?, status, note }
+  queue: [],
+
+  // Limits that apply to every task in the queue. Both spend, so both are guarded.
+  essenceFloor: 0, // never take an essence below this quantity
+  rerollMax: 500, // give up on a reroll task after this many tries
+
+  savedAt: 0, // stamped on every write; the only honest proof a write survived a reload
 };
 
 let settings = structuredClone(DEFAULTS);
@@ -147,19 +159,20 @@ function loadSettings() {
     if (typeof saved === "string") saved = JSON.parse(saved);
     if (!saved || typeof saved !== "object") {
       log("no saved settings for this character; using defaults");
-      settings.enabled = readEnabledSetting(settings.enabled);
       settingsLoaded = true;
       return;
     }
-    const legacyEnabled = typeof saved.enabled === "boolean" ? saved.enabled : settings.enabled;
-    settings = {
-      ...structuredClone(DEFAULTS),
-      ...saved,
-      enabled: readEnabledSetting(legacyEnabled),
-      rerollTargetModIDs: saved.rerollTargetModIDs ?? [],
-    };
+    settings = { ...structuredClone(DEFAULTS), ...saved, queue: saved.queue ?? [] };
+    // Nothing is running yet, whatever the save says.
+    for (const task of settings.queue) if (task.status === "running") task.status = "pending";
     settingsLoaded = true;
-    log("settings loaded", settings);
+
+    // The one thing that actually proves persistence works: settings we wrote in an earlier
+    // session came back. A canary round-trip can't tell you this — the store can work in memory
+    // and still be dropped when the character save is written, which is exactly what happens to
+    // a local mod that isn't linked to mod.io.
+    const age = settings.savedAt ? Math.round((Date.now() - settings.savedAt) / 1000) : null;
+    log(age === null ? "settings loaded" : `settings loaded (saved ${age}s ago)`, settings);
   } catch (err) {
     warn("could not load settings, using defaults", err);
   }
@@ -171,11 +184,23 @@ function saveSettings() {
     return;
   }
   try {
+    // Stamped so the next load can prove the write survived. See loadSettings().
+    settings.savedAt = Date.now();
+
     // Round-trip through JSON so we can never hand characterStorage something
     // unserialisable, and so what we store is exactly what we'll read back.
-    // `enabled` is owned by ctx.settings, which the game already persists per character.
-    const { enabled, ...storedSettings } = settings;
-    storage.setItem(STORAGE_KEY, JSON.parse(JSON.stringify(storedSettings)));
+    const payload = JSON.parse(JSON.stringify(settings));
+
+    const size = JSON.stringify(payload).length;
+    if (size > STORAGE_LIMIT) {
+      warn(
+        `settings are ${size} bytes, over Melvor's ${STORAGE_LIMIT}-byte limit for a mod's character storage — ` +
+          "they will not be saved. Clear some finished tasks from the queue.",
+      );
+      return;
+    }
+
+    storage.setItem(STORAGE_KEY, payload);
 
     // characterStorage is only written into the save file when the game next saves. Without
     // this, changing a setting and then reloading (or closing the tab) before the next
@@ -186,36 +211,38 @@ function saveSettings() {
   }
 }
 
-function readEnabledSetting(fallback = settings.enabled) {
-  try {
-    const value = settingsSection?.get?.("enabled");
-    return typeof value === "boolean" ? value : Boolean(fallback);
-  } catch (err) {
-    warn("could not read the settings switch", err);
-    return Boolean(fallback);
+// Melvor's wiki, on both Mod Settings and character storage:
+//
+//   "When loading your mod as a Local Mod via the Creator Toolkit, the mod must be linked to
+//    mod.io and you must have subscribed to and installed the mod via mod.io in order for this
+//    data to persist."
+//
+// So a local mod that isn't linked to mod.io silently saves nothing, which looks exactly like a
+// bug in here. Round-trip a canary and say so plainly instead of leaving you to guess.
+function checkStorage() {
+  if (!storage?.setItem) {
+    warn("characterStorage is unavailable — settings cannot be saved this session.");
+    return false;
   }
-}
-
-let syncingSettingsSection = false;
-function writeEnabledSetting(value) {
   try {
-    if (!settingsSection?.set) return;
-    syncingSettingsSection = true;
-    settingsSection.set("enabled", Boolean(value));
-  } catch (err) {
-    warn("could not write the settings switch", err);
-  } finally {
-    syncingSettingsSection = false;
-  }
-}
+    const canary = `canary-${Date.now()}`;
+    storage.setItem("storage-check", canary);
+    const readBack = storage.getItem("storage-check");
+    storage.removeItem?.("storage-check");
 
-function setEnabled(value, { writeSetting = false } = {}) {
-  settings.enabled = Boolean(value);
-  if (writeSetting) writeEnabledSetting(settings.enabled);
-  getGame()?.scheduleSave?.();
-  applyTakeover();
-  if (!settings.enabled) endJob("stopped: automation is off");
-  updatePanel();
+    if (readBack !== canary) {
+      warn(
+        "characterStorage did not read back what we wrote — settings will not persist. " +
+          "If this is a local mod, Melvor requires it to be linked to mod.io and installed from " +
+          "there before any mod data is saved.",
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    warn("characterStorage threw; settings will not persist", err);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,52 +266,48 @@ function isEssence(item) {
   return typeof item?.id === "string" && item.id.endsWith("_Essence");
 }
 
-function bankEntryItem(entry) {
-  return entry?.item ?? entry;
+function byName(items) {
+  return [...items].sort((a, b) => String(a.name).localeCompare(String(b.name)));
 }
 
-function matchingBankItems(bank, predicate) {
-  return bank
-    .filterItems((entry) => predicate(bankEntryItem(entry), entry))
-    .map(bankEntryItem)
-    .filter((item) => item !== undefined);
+// Bank.filterItems() hands its predicate a BankItem. What it *returns* is the plain Item — that
+// is how the Enchanting mod itself uses it — but a bank-entry record has been seen coming back
+// instead, and the two are easy to confuse: an enchanted item also has an `.item` (its base).
+// A BankItem is the one that also carries `.quantity`, so unwrap on that and nothing else.
+function unwrap(entry) {
+  return entry?.quantity !== undefined && entry?.item !== undefined ? entry.item : entry;
+}
+
+// Every bank item matching `pred`, as Items, sorted by name. `pred` is given the Item.
+function bankItems(pred) {
+  const bank = getBank();
+  if (!bank) return [];
+  return byName(bank.filterItems((bankItem) => pred(unwrap(bankItem))).map(unwrap));
 }
 
 // Every enchanted item in the bank at or below `grade`, locked ones left alone.
 function disenchantTargets(ench, grade) {
-  const bank = getBank();
-  if (!bank || grade < 0) return [];
-  return matchingBankItems(
-    bank,
-    (item) =>
-      ench.isAugmentedItem(item) &&
-      qualityOf(item) <= grade &&
-      !bank.lockedItems.has(item),
+  if (grade < 0) return [];
+  return bankItems(
+    (item) => ench.isAugmentedItem(item) && qualityOf(item) <= grade && !isLocked(item),
   );
 }
 
-// Every bank item that could be enchanted at least one more grade towards `target`. Plain
-// equipment counts (an enchant turns it into a grade-1 item); locked items never do.
-function enchantTargets(ench, target) {
-  const bank = getBank();
-  if (!bank) return [];
-  return matchingBankItems(bank, (item) => {
-    if (bank.lockedItems.has(item)) return false;
-    if (!ench.isAugmentedItem(item) && !ench.canAugmentItem(item)) return false;
-    return qualityOf(item) < Math.min(target, MAX_QUALITY);
-  });
+// Everything you could put in an enchant task: plain equipment (an enchant makes it grade 1)
+// and enchanted items below Mythic. Locked items never qualify.
+function enchantable(ench) {
+  return bankItems(
+    (item) =>
+      !isLocked(item) &&
+      (ench.isAugmentedItem(item) || ench.canAugmentItem(item)) &&
+      qualityOf(item) < MAX_QUALITY,
+  );
 }
 
 // Enchanted items with at least one modifier slot are the only things worth rerolling.
-function rerollCandidates(ench) {
-  const bank = getBank();
-  if (!bank) return [];
-  return matchingBankItems(
-    bank,
-    (item) =>
-      ench.isAugmentedItem(item) &&
-      item.extraModifiers?.size > 0 &&
-      !bank.lockedItems.has(item),
+function rerollable(ench) {
+  return bankItems(
+    (item) => ench.isAugmentedItem(item) && item.extraModifiers?.size > 0 && !isLocked(item),
   );
 }
 
@@ -303,6 +326,15 @@ function actionByID(ench, id) {
 // must come back as undefined, not as an invented object.
 function modByID(ench, id) {
   return ench.mods?.allObjects?.find((mod) => mod.id === id);
+}
+
+// An EnchantingMod doesn't always carry a display name, and its local id is camelCase —
+// "increasedGlobalAccuracy" is not something to show someone. Space it out and capitalise it.
+function modName(mod) {
+  if (!mod) return "?";
+  if (mod.name) return mod.name;
+  const local = mod.localID ?? String(mod.id ?? "").split(":").pop();
+  return local.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -438,8 +470,8 @@ function patchItemCreation(proto) {
 
 // action() gives the rewards, consumes the costs, and then immediately starts itself again on
 // the same item. That is how a disenchant drains a whole stack for us — but for an enchant it
-// would burn the rest of the stack up to grade 1 instead of walking one item to the target.
-// So an enchant job takes the decision back after every single action.
+// would burn the rest of the stack up to grade 1 instead of walking one item to its target.
+// So an enchant task takes the decision back after every single action.
 function patchAction(proto) {
   const original = proto?.action;
   if (typeof original !== "function" || original[PATCH_FLAG]) return;
@@ -447,10 +479,13 @@ function patchAction(proto) {
   const patched = function (...args) {
     const result = original.apply(this, args);
     try {
-      if (job?.type === "enchant") {
-        // Synchronous: createEnchantingItem ran inside the action we just let finish, so
-        // nothing else can have created an item in between.
-        job.produced = lastCreated;
+      const task = runningTask();
+      if (task?.kind === "enchant") {
+        // Hand the task its new item here and now, not in the deferred callback below.
+        // createEnchantingItem() ran inside the action we just let finish, so lastCreated can
+        // only be the item that action made — and doing it synchronously means a Stop landing
+        // in between still leaves the task pointing at an item that actually exists.
+        job.followed = adoptProduced(this, task, lastCreated);
         // Defer the decision by a macrotask so the mod's own handler is completely done.
         setTimeout(() => onEnchantActionDone(), 0);
       }
@@ -461,6 +496,22 @@ function patchAction(proto) {
   };
   patched[PATCH_FLAG] = true;
   proto.action = patched;
+}
+
+// Only follow the new item if it really is the old one, one grade up.
+function adoptProduced(ench, task, produced) {
+  const previous = job.item;
+  const followsOn =
+    produced &&
+    ench.isAugmentedItem(produced) &&
+    produced.item === (previous?.item ?? previous) &&
+    qualityOf(produced) === qualityOf(previous) + 1;
+
+  if (!followsOn) return false;
+
+  adoptItem(task, produced);
+  saveSettings(); // once per 10-second enchant; cheap, and it makes a Stop safe
+  return true;
 }
 
 function installPatches(ench) {
@@ -491,6 +542,8 @@ function installPatches(ench) {
 
 // ---------------------------------------------------------------------------
 // Jobs
+//
+// One job at a time — the bank sweep and the queue both want the skill's action slot.
 // ---------------------------------------------------------------------------
 
 function setStatus(text) {
@@ -510,17 +563,24 @@ function beginJob(newJob, statusText) {
 
 function endJob(reason) {
   if (!job) return;
+
   const ench = getEnchanting();
   try {
     if (ench?.isActive) ench.stop();
   } catch (err) {
     warn("could not stop the Enchanting skill", err);
   }
+
+  // A task we were part-way through goes back to pending, so Start picks it up again.
+  const task = runningTask();
+  if (task) task.status = "pending";
+
   job = null;
   if (driver) {
     clearInterval(driver);
     driver = null;
   }
+  saveSettings();
   setStatus(reason);
   updatePanel();
 }
@@ -579,49 +639,45 @@ function driveJob() {
   }
 
   try {
-    switch (job.type) {
-      case "disenchant":
-        driveDisenchant(ench);
-        break;
-      case "enchant":
-        driveEnchant(ench);
-        break;
-      case "reroll":
-        driveReroll(ench);
-        break;
-      default:
-        endJob("idle");
-    }
+    if (job.type === "sweep") driveSweep(ench);
+    else if (job.type === "queue") driveQueue(ench);
+    else endJob("idle");
   } catch (err) {
     console.error(`${TAG} job failed`, err);
     endJob("stopped: something went wrong (see the console)");
   }
 }
 
-// --- Disenchant ------------------------------------------------------------
+// --- The bank sweep --------------------------------------------------------
 
-function startDisenchantJob() {
+function startSweep() {
   const ench = getEnchanting();
   if (!ench) return;
+
   if (settings.bankDisenchantGrade < 0) {
     setStatus("pick a grade to disenchant first");
     return;
   }
-  const instant = settings.bankDisenchantMode === "instant";
   const count = disenchantTargets(ench, settings.bankDisenchantGrade).length;
   if (!count) {
     setStatus("nothing in the bank at that grade or below");
     return;
   }
+
   beginJob(
-    { type: "disenchant", grade: settings.bankDisenchantGrade, instant, done: 0 },
+    {
+      type: "sweep",
+      grade: settings.bankDisenchantGrade,
+      instant: settings.bankDisenchantMode === "instant",
+      done: 0,
+    },
     `disenchanting ${count} stack${count === 1 ? "" : "s"} of ${qualityName(settings.bankDisenchantGrade)} or below`,
   );
 }
 
-function driveDisenchant(ench) {
+function driveSweep(ench) {
   if (job.instant) {
-    driveInstantDisenchant(ench);
+    driveInstantSweep(ench);
     return;
   }
 
@@ -647,7 +703,7 @@ function driveDisenchant(ench) {
   setStatus(`disenchanting ${next.name} — ${remaining.length} stack${remaining.length === 1 ? "" : "s"} left`);
 }
 
-function driveInstantDisenchant(ench) {
+function driveInstantSweep(ench) {
   const targets = disenchantTargets(ench, job.grade);
   if (!targets.length) {
     endJob(`done: instantly disenchanted ${job.done} stack${job.done === 1 ? "" : "s"}`);
@@ -703,89 +759,169 @@ function instantDisenchant(ench, item, qty) {
   return !notAllGiven;
 }
 
-// --- Enchant ---------------------------------------------------------------
+// --- The task queue --------------------------------------------------------
 
-function startEnchantJob(pickedItem) {
+function runningTask() {
+  if (job?.type !== "queue" || !job.taskID) return undefined;
+  return settings.queue.find((task) => task.id === job.taskID);
+}
+
+function nextTaskID() {
+  return `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function addTask(task) {
+  settings.queue.push({ id: nextTaskID(), status: "pending", note: "", ...task });
+  saveSettings();
+  updatePanel();
+}
+
+function removeTask(id) {
+  if (runningTask()?.id === id) endJob("stopped: the running task was removed");
+  settings.queue = settings.queue.filter((task) => task.id !== id);
+  saveSettings();
+  updatePanel();
+}
+
+function clearFinished() {
+  settings.queue = settings.queue.filter((task) => task.status === "pending" || task.status === "running");
+  saveSettings();
+  updatePanel();
+}
+
+function finishTask(task, status, note) {
+  task.status = status;
+  task.note = note;
+  job.taskID = null;
+  job.item = null;
+  job.targets = null;
+  job.rerolls = 0;
+  saveSettings();
+  setStatus(`${task.itemName}: ${note}`);
+}
+
+function startQueue() {
   const ench = getEnchanting();
   if (!ench) return;
 
-  const target = Math.min(settings.enchantTarget, MAX_QUALITY);
-  if (target < 1) {
-    setStatus("pick a grade to enchant up to first");
+  if (!settings.queue.some((task) => task.status === "pending")) {
+    setStatus("nothing queued");
     return;
   }
-
-  const single = settings.enchantScope === "single";
-  if (single && !pickedItem) {
-    setStatus("pick an item to enchant first");
-    return;
-  }
-  if (!single && !enchantTargets(ench, target).length) {
-    setStatus(`nothing in the bank below ${qualityName(target)}`);
-    return;
-  }
-
-  beginJob(
-    { type: "enchant", target, single, item: single ? pickedItem : null, produced: null, done: 0 },
-    `enchanting up to ${qualityName(target)}`,
-  );
+  beginJob({ type: "queue", taskID: null, item: null, targets: null, produced: null, rerolls: 0 }, "working through the queue");
 }
 
-function driveEnchant(ench) {
-  if (!skillSlotFree(ench)) {
-    endJob("stopped: another skill or combat is using the action slot");
-    return;
-  }
-  if (ench.isActive) return; // an enchant is running; the action hook will take it from here
+// Point a running task at the item it now owns.
+//
+// An enchant or a reroll REPLACES the item with a new object carrying a new (random) id. The
+// task has to be moved with it: if it kept naming the item it started from, stopping the queue
+// and starting it again would go looking for an item that has already been consumed, and the
+// row would fail. The caller persists — this is called once per reroll, and saving on every
+// one of those would be silly.
+function adoptItem(task, item) {
+  job.item = item;
+  task.itemID = item.id;
+  task.itemName = item.name;
+}
 
-  const item = job.item ?? enchantTargets(ench, job.target)[0];
-  if (!item) {
-    endJob(`done: enchanted ${job.done} item${job.done === 1 ? "" : "s"} to ${qualityName(job.target)}`);
-    return;
-  }
+// Search the whole bank, not just the items eligible for this kind of task: an enchant task
+// whose item has already reached Mythic is *finished*, not lost, and the drive functions below
+// are the ones that say so.
+function resolveTaskItem(task) {
+  return findInBank(bankItems(() => true), task.itemID);
+}
 
-  if (qualityOf(item) >= job.target) {
-    job.done += 1;
-    if (job.single) {
-      endJob(`done: ${item.name} is ${qualityName(job.target)}`);
+function driveQueue(ench) {
+  let task = runningTask();
+
+  if (!task) {
+    task = settings.queue.find((entry) => entry.status === "pending");
+    if (!task) {
+      endJob("done: the queue is finished");
       return;
     }
-    job.item = null; // that one's finished; the next tick picks another
-    return;
+
+    const item = resolveTaskItem(task);
+    if (!item) {
+      finishTask(task, "failed", "not in the bank any more");
+      return;
+    }
+    if (isLocked(item)) {
+      finishTask(task, "failed", "the item is locked");
+      return;
+    }
+
+    task.status = "running";
+    job.taskID = task.id;
+    job.item = item;
+    job.rerolls = 0;
+    job.followed = true;
+
+    if (task.kind === "reroll") {
+      if (!ench.isAugmentedItem(item)) {
+        finishTask(task, "failed", "not an enchanted item any more");
+        return;
+      }
+      const targets = task.modIDs.map((id) => modByID(ench, id)).filter((mod) => mod !== undefined);
+      if (!targets.length) {
+        finishTask(task, "failed", "none of those modifiers exist any more");
+        return;
+      }
+      job.targets = new Set(targets);
+    }
+    saveSettings();
   }
 
+  if (task.kind === "enchant") driveEnchantTask(ench, task);
+  else driveRerollTask(ench, task);
+}
+
+function driveEnchantTask(ench, task) {
+  if (!skillSlotFree(ench)) {
+    endJob("paused: another skill or combat is using the action slot");
+    return;
+  }
+  if (ench.isActive) return; // an enchant is running; the action hook takes it from here
+
+  const item = job.item;
+  const target = Math.min(task.target, MAX_QUALITY);
+
+  if (qualityOf(item) >= target) {
+    finishTask(task, "done", `now ${qualityName(target)}`);
+    return;
+  }
   if (isLocked(item)) {
-    endJob(`stopped: ${item.name} is locked`);
+    finishTask(task, "failed", "the item is locked");
     return;
   }
 
   const costs = ench.getEnchantCosts(item);
   if (ench.isCostEmpty(costs)) {
-    endJob(`stopped: ${item.name} can't be enchanted any further`);
+    finishTask(task, "failed", "can't be enchanted any further");
     return;
   }
   if (!costs.checkIfOwned()) {
-    endJob("stopped: not enough essence for the next enchant");
+    finishTask(task, "failed", "not enough essence");
     return;
   }
   if (belowEssenceFloor(costs)) {
-    endJob(`stopped: the next enchant would take an essence below your floor of ${settings.essenceFloor}`);
+    finishTask(task, "failed", `would take an essence below your floor of ${settings.essenceFloor}`);
     return;
   }
 
   if (!startSkillAction(ench, ENCHANT, item)) {
-    endJob(`stopped: could not enchant ${item.name}`);
+    finishTask(task, "failed", "could not start the enchant");
     return;
   }
-  job.item = item;
   setStatus(`enchanting ${item.name} → ${qualityName(qualityOf(item) + 1)}`);
 }
 
 // Runs a macrotask after each completed enchant. The mod has already restarted itself on the
 // old item by now, so stop it — nothing is lost, since an action's costs are consumed only
-// when it finishes — and carry on with the item it just made.
+// when it finishes — and carry on with the item the action hook adopted.
 function onEnchantActionDone() {
-  if (job?.type !== "enchant") return;
+  const task = runningTask();
+  if (task?.kind !== "enchant") return;
 
   const ench = getEnchanting();
   if (!ench) return;
@@ -796,85 +932,40 @@ function onEnchantActionDone() {
     warn("could not stop the Enchanting skill", err);
   }
 
-  const previous = job.item;
-  const produced = job.produced;
-  job.produced = null;
-
-  // Only follow the new item if it really is the old one, one grade up.
-  const followsOn =
-    produced &&
-    ench.isAugmentedItem(produced) &&
-    produced.item === (previous?.item ?? previous) &&
-    qualityOf(produced) === qualityOf(previous) + 1;
-
-  job.item = followsOn ? produced : null;
-
-  if (job.single && !followsOn) {
-    endJob("stopped: lost track of the item after the enchant");
-    return;
+  if (!job.followed) {
+    finishTask(task, "failed", "lost track of the item after the enchant");
   }
-
   driveJob();
 }
 
-// --- Reroll ----------------------------------------------------------------
-
-function startRerollJob(pickedItem) {
-  const ench = getEnchanting();
-  if (!ench) return;
-
-  if (!pickedItem || !ench.isAugmentedItem(pickedItem)) {
-    setStatus("pick an enchanted item to reroll first");
-    return;
-  }
-
-  const targets = new Set(
-    settings.rerollTargetModIDs.map((id) => modByID(ench, id)).filter((mod) => mod !== undefined),
-  );
-  if (!targets.size) {
-    setStatus("pick at least one modifier you want");
-    return;
-  }
-  if (targets.size > pickedItem.extraModifiers.size) {
-    setStatus(
-      `${pickedItem.name} has only ${pickedItem.extraModifiers.size} modifier slot${
-        pickedItem.extraModifiers.size === 1 ? "" : "s"
-      } — you asked for ${targets.size}`,
-    );
-    return;
-  }
-
-  beginJob(
-    { type: "reroll", item: pickedItem, targets, count: 0, max: settings.rerollMax },
-    `rerolling ${pickedItem.name}`,
-  );
-}
-
-function driveReroll(ench) {
+function driveRerollTask(ench, task) {
   for (let i = 0; i < REROLL_BATCH; i += 1) {
-    if (!rerollStep(ench)) return;
+    if (!rerollStep(ench, task)) return;
   }
-  setStatus(`rerolling ${job.item.name} (${job.count}/${job.max})`);
+  // Every reroll gave the task a new item id. Persist once per batch rather than per reroll,
+  // so a Stop (or a reload) resumes from the item the task actually holds now.
+  saveSettings();
+  setStatus(`rerolling ${job.item.name} (${job.rerolls}/${settings.rerollMax})`);
 }
 
-// One reroll, or a reason to stop. Returns false once the job is over.
-function rerollStep(ench) {
+// One reroll, or a reason the task is over. Returns false once it is.
+function rerollStep(ench, task) {
   const item = job.item;
   const bank = getBank();
 
   if (!item || bank.getQty(item) <= 0) {
-    endJob("stopped: the item is no longer in the bank");
+    finishTask(task, "failed", "the item is no longer in the bank");
     return false;
   }
   if (isLocked(item)) {
-    endJob(`stopped: ${item.name} is locked`);
+    finishTask(task, "failed", "the item is locked");
     return false;
   }
 
   // Done as soon as every modifier you asked for is on the item — the others can be anything.
   const missing = [...job.targets].filter((mod) => !item.extraModifiers.has(mod));
   if (!missing.length) {
-    endJob(`done: ${item.name} has every modifier you wanted (${job.count} reroll${job.count === 1 ? "" : "s"})`);
+    finishTask(task, "done", `rolled it in ${job.rerolls} reroll${job.rerolls === 1 ? "" : "s"}`);
     return false;
   }
 
@@ -882,23 +973,28 @@ function rerollStep(ench) {
   // modifier the item already has, so the ones you wanted are never at risk.
   const slot = [...item.extraModifiers].find((mod) => !job.targets.has(mod));
   if (!slot) {
-    endJob(`stopped: no slot left to reroll — ${item.name} can't hold all of those modifiers`);
+    finishTask(task, "failed", "not enough modifier slots for all of those");
+    return false;
+  }
+  if (job.rerolls >= settings.rerollMax) {
+    finishTask(task, "failed", `gave up after ${settings.rerollMax} rerolls`);
     return false;
   }
 
-  if (job.count >= job.max) {
-    endJob(`stopped: hit the ${job.max}-reroll cap (${missing.length} still missing)`);
+  const costs = ench.getRerollCosts(item);
+  if (belowEssenceFloor(costs)) {
+    finishTask(task, "failed", `would take an essence below your floor of ${settings.essenceFloor}`);
     return false;
   }
 
   const next = rerollSlot(ench, item, slot);
   if (!next) {
-    endJob("stopped: could not reroll (out of essence, or the bank is full)");
+    finishTask(task, "failed", "out of essence, or the bank is full");
     return false;
   }
 
-  job.item = next;
-  job.count += 1;
+  adoptItem(task, next);
+  job.rerolls += 1;
   return true;
 }
 
@@ -947,34 +1043,7 @@ function rerollSlot(ench, item, modToReplace) {
 // ---------------------------------------------------------------------------
 
 let panelEl = null;
-const parts = {}; // the live nodes updatePanel() refreshes
-const itemTokens = new WeakMap();
-let nextItemToken = 1;
-
-function itemToken(item) {
-  let token = itemTokens.get(item);
-  if (!token) {
-    token = `item-${nextItemToken}`;
-    nextItemToken += 1;
-    itemTokens.set(item, token);
-  }
-  return token;
-}
-
-function itemFromSelect(select, currentItems) {
-  return select?.__items?.get(select.value) ?? findInBank(currentItems, select?.value);
-}
-
-function formatModifierName(mod) {
-  const raw = String(mod?.name ?? mod?.localID ?? mod?.id ?? "");
-  const local = raw.includes(":") ? raw.slice(raw.lastIndexOf(":") + 1) : raw;
-  const spaced = local
-    .replace(/[_-]+/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/\s+/g, " ")
-    .trim();
-  return spaced ? spaced[0].toUpperCase() + spaced.slice(1) : raw;
-}
+const parts = {};
 
 function injectStyles() {
   if (document.getElementById(`${MARK}-styles`)) return;
@@ -983,71 +1052,128 @@ function injectStyles() {
   style.textContent = `
     .${MARK}-hidden { display: none !important; }
     .${MARK}-panel { margin-bottom: 1rem; }
-    .${MARK}-row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; padding: .5rem 0; }
-    .${MARK}-row + .${MARK}-row { border-top: 1px solid rgba(128,128,128,.2); }
-    .${MARK}-row > h4 { flex: 0 0 100%; margin: 0 0 .25rem; font-size: .9rem; font-weight: 600; }
-    .${MARK}-panel label { margin: 0; font-weight: 400; cursor: pointer; }
-    .${MARK}-panel select, .${MARK}-panel input[type=number] { max-width: 16rem; display: inline-block; }
-    .${MARK}-mods { max-height: 8rem; min-width: 16rem; }
-    .${MARK}-note { opacity: .6; font-size: .8em; }
-    .${MARK}-status { margin-top: .5rem; font-size: .875rem; opacity: .75; }
+    .${MARK}-panel .block-content { padding-bottom: .75rem; }
+
+    .${MARK}-section + .${MARK}-section { margin-top: .5rem; border-top: 1px solid rgba(128,128,128,.2); }
+    .${MARK}-section { padding-top: .75rem; }
+    .${MARK}-title {
+      margin: 0 0 .5rem; font-size: .75rem; font-weight: 700;
+      letter-spacing: .06em; text-transform: uppercase; opacity: .65;
+    }
+
+    .${MARK}-line { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .75rem; }
+    .${MARK}-line + .${MARK}-line { margin-top: .5rem; }
+    .${MARK}-field { display: flex; flex-direction: column; gap: .15rem; }
+    .${MARK}-field > span { font-size: .7rem; font-weight: 600; opacity: .7; }
+    .${MARK}-field select, .${MARK}-field input { min-width: 8rem; }
+    .${MARK}-field-wide select { min-width: 18rem; }
+    .${MARK}-check { display: flex; align-items: center; gap: .3rem; height: 2rem; }
+    .${MARK}-check label { margin: 0; font-weight: 400; cursor: pointer; }
+    .${MARK}-spacer { flex: 1 1 auto; }
+    .${MARK}-note { font-size: .8rem; opacity: .6; }
+
+    .${MARK}-table { width: 100%; margin: .5rem 0 0; }
+    .${MARK}-table th { font-size: .7rem; text-transform: uppercase; opacity: .6; }
+    .${MARK}-table th, .${MARK}-table td { padding: .3rem .5rem; vertical-align: middle; }
+    .${MARK}-table select { max-width: 10rem; }
+
+    .${MARK}-status { margin-top: .75rem; font-size: .85rem; opacity: .75; }
+    .${MARK}-pending { opacity: .7; }
+    .${MARK}-running { font-weight: 600; }
+    .${MARK}-done { color: #46c37b; }
+    .${MARK}-failed { color: #d26a5c; }
   `;
   document.head.append(style);
 }
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function section(title) {
+  const wrap = el("div", `${MARK}-section`);
+  wrap.append(el("h4", `${MARK}-title`, title));
+  return wrap;
+}
+
+function line() {
+  return el("div", `${MARK}-line`);
+}
+
+// Buttons sit in their own box so they line up with the bottom of the labelled fields beside
+// them rather than with the labels.
+function buttons(...nodes) {
+  const wrap = el("div", `${MARK}-check`);
+  wrap.append(...nodes);
+  return wrap;
+}
+
+// A labelled control, stacked so every row lines up on the same baseline.
+function field(label, control, wide) {
+  const wrap = el("div", `${MARK}-field${wide ? ` ${MARK}-field-wide` : ""}`);
+  wrap.append(el("span", null, label), control);
+  return wrap;
+}
+
 function checkbox(key, label) {
-  const wrap = document.createElement("label");
+  const wrap = el("div", `${MARK}-check`);
   const input = document.createElement("input");
   input.type = "checkbox";
+  input.id = `${MARK}-${key}`;
   input.checked = Boolean(settings[key]);
   input.addEventListener("change", () => {
-    if (key === "enabled") {
-      setEnabled(input.checked, { writeSetting: true });
-      return;
-    }
     settings[key] = input.checked;
     saveSettings();
+    if (key === "enabled") {
+      syncSettingsSection();
+      applyTakeover();
+      if (!input.checked) endJob("stopped: automation is off");
+    }
     updatePanel();
   });
-  wrap.append(input, document.createTextNode(` ${label}`));
+
+  const text = document.createElement("label");
+  text.htmlFor = input.id;
+  text.textContent = label;
+
+  wrap.append(input, text);
   parts[key] = input;
   return wrap;
 }
 
-function gradeSelect(key, { includeOff = true, from = 0 } = {}) {
-  const select = document.createElement("select");
-  select.className = "form-control form-control-sm";
-  if (includeOff) {
-    const off = document.createElement("option");
-    off.value = String(OFF);
-    off.textContent = "Off";
-    select.append(off);
-  }
-  for (let quality = from; quality <= MAX_QUALITY; quality += 1) {
+function select(options, value, onChange) {
+  const node = el("select", "form-control form-control-sm");
+  for (const [optionValue, optionText] of options) {
     const option = document.createElement("option");
-    option.value = String(quality);
-    option.textContent = QUALITIES[quality];
-    select.append(option);
+    option.value = String(optionValue);
+    option.textContent = optionText;
+    node.append(option);
   }
-  select.value = String(settings[key]);
-  select.addEventListener("change", () => {
-    settings[key] = Number(select.value);
+  node.value = String(value);
+  node.addEventListener("change", () => onChange(node.value));
+  return node;
+}
+
+function gradeOptions({ includeOff = false, from = 0 } = {}) {
+  const options = includeOff ? [[OFF, "Off"]] : [];
+  for (let quality = from; quality <= MAX_QUALITY; quality += 1) options.push([quality, QUALITIES[quality]]);
+  return options;
+}
+
+function gradeSelect(key, options) {
+  return select(gradeOptions(options), settings[key], (value) => {
+    settings[key] = Number(value);
     saveSettings();
     updatePanel();
   });
-  return select;
 }
 
-function labelled(text, node) {
-  const label = document.createElement("label");
-  label.append(document.createTextNode(`${text} `), node);
-  return label;
-}
-
-function numberInput(key, { min = 0 } = {}) {
-  const input = document.createElement("input");
+function numberInput(key, min = 0) {
+  const input = el("input", "form-control form-control-sm");
   input.type = "number";
-  input.className = "form-control form-control-sm";
   input.min = String(min);
   input.value = String(settings[key]);
   input.addEventListener("change", () => {
@@ -1059,70 +1185,328 @@ function numberInput(key, { min = 0 } = {}) {
   return input;
 }
 
-function itemSelect() {
-  const select = document.createElement("select");
-  select.className = "form-control form-control-sm";
-  select.__options = null; // not "" — an empty bank is a real list, and must still render
-  select.__items = new Map();
-  return select;
+function button(label, className, onClick) {
+  const node = el("button", `btn btn-sm ${className}`, label);
+  node.addEventListener("click", onClick);
+  return node;
 }
 
-// Rebuilds an item dropdown only when the set of items in it actually changes, so it can be
-// refreshed on a timer without snatching the list out from under a click.
-function refreshItemSelect(select, items, placeholder) {
-  const entries = items.map((item) => [itemToken(item), item]);
-  const key = entries.map(([token]) => token).join(",");
-  if (select.__options === key) return;
-  select.__options = key;
-  select.__items = new Map(entries);
+// An item dropdown, rebuilt only when the set of items in it actually changes — so it can be
+// refreshed on a timer without snatching the list out from under a click. Alphabetical.
+function itemSelect() {
+  const node = el("select", "form-control form-control-sm");
+  node.__options = null;
+  return node;
+}
 
-  const previous = select.value;
-  select.replaceChildren();
+function refreshItemSelect(node, items) {
+  if (!node) return;
+  const bank = getBank();
+
+  // Keyed on quantity as well as identity: enchanting or disenchanting something changes how
+  // many you have of it without changing the list, and a count that doesn't move is exactly
+  // the "this list is stale" bug. Rebuilding only on a real change still keeps the dropdown
+  // from being yanked out from under a click.
+  const key = items.map((item) => `${item.id}:${bank?.getQty?.(item) ?? 0}`).join(",");
+  if (node.__options === key) return;
+  node.__options = key;
+
+  const previous = node.value;
+  node.replaceChildren();
 
   const none = document.createElement("option");
   none.value = "";
-  none.textContent = placeholder;
-  select.append(none);
+  none.textContent = items.length ? "— pick an item —" : "— nothing eligible —";
+  node.append(none);
 
-  const bank = getBank();
-  for (const [token, item] of entries) {
+  for (const item of items) {
     const option = document.createElement("option");
-    option.value = token;
+    option.value = item.id;
     option.textContent = `${item.name} (${bank?.getQty?.(item) ?? 0})`;
-    select.append(option);
+    node.append(option);
   }
-  select.value = select.__items.has(previous) ? previous : "";
+  node.value = items.some((item) => item.id === previous) ? previous : "";
 }
 
-function startStop(onStart, jobType) {
-  const button = document.createElement("button");
-  button.className = "btn btn-sm btn-success";
-  button.textContent = "Start";
-  button.addEventListener("click", () => {
-    if (job?.type === jobType) endJob("stopped");
-    else onStart();
+// --- Sections --------------------------------------------------------------
+
+function buildLootSection() {
+  const wrap = section("Auto-disenchant new loot");
+
+  const table = el("table", `table table-sm ${MARK}-table`);
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const text of ["Source", "Disenchant up to", "Include Common", "Downgrade"]) {
+    headRow.append(el("th", null, text));
+  }
+  head.append(headRow);
+
+  const body = document.createElement("tbody");
+  for (const [label, gradeKey, commonKey, downgradeKey] of [
+    ["Crafting rewards", "autoDisenchantRewards", "includeCommonRewards", "downgradeRewards"],
+    ["Other drops", "autoDisenchantDrops", "includeCommonDrops", "downgradeDrops"],
+  ]) {
+    const row = document.createElement("tr");
+    const name = el("td", null, label);
+
+    const grade = document.createElement("td");
+    grade.append(gradeSelect(gradeKey, { includeOff: true }));
+
+    const common = document.createElement("td");
+    common.append(checkbox(commonKey, ""));
+
+    const downgrade = document.createElement("td");
+    downgrade.append(checkbox(downgradeKey, ""));
+
+    row.append(name, grade, common, downgrade);
+    body.append(row);
+  }
+  table.append(head, body);
+
+  wrap.append(
+    table,
+    el(
+      "div",
+      `${MARK}-note`,
+      "Replaces the Enchanting mod's own auto-disenchant. Instant, at half XP, exactly as before.",
+    ),
+  );
+  return wrap;
+}
+
+function buildSweepSection() {
+  const wrap = section("Disenchant the bank");
+
+  const count = el("span", `${MARK}-note`);
+  parts.sweepCount = count;
+
+  const sweepButton = button("Start", "btn-success", () => {
+    if (job?.type === "sweep") endJob("stopped");
+    else startSweep();
   });
-  return button;
+  parts.sweepButton = sweepButton;
+
+  const controls = line();
+  controls.append(
+    field("Grade and below", gradeSelect("bankDisenchantGrade", { includeOff: true })),
+    field(
+      "Mode",
+      select(
+        [
+          ["skill", "Use the skill (full XP)"],
+          ["instant", "Instant (half XP)"],
+        ],
+        settings.bankDisenchantMode,
+        (value) => {
+          settings.bankDisenchantMode = value;
+          saveSettings();
+          updatePanel();
+        },
+      ),
+    ),
+    buttons(sweepButton, count),
+  );
+
+  wrap.append(
+    controls,
+    el(
+      "div",
+      `${MARK}-note`,
+      "Locked items are always skipped. The skill mode stops if combat or another skill needs the action slot.",
+    ),
+  );
+  return wrap;
+}
+
+function buildQueueSection() {
+  const wrap = section("Task queue");
+
+  // Add an enchant task.
+  const enchantItem = itemSelect();
+  parts.enchantItem = enchantItem;
+
+  // Not persisted: it's what the next Add will use, not a setting.
+  const enchantGrade = select(gradeOptions({ from: 1 }), 3, () => {});
+  parts.enchantGrade = enchantGrade;
+
+  const addEnchant = line();
+  addEnchant.append(
+    field("Enchant", enchantItem, true),
+    field("Up to", enchantGrade),
+    buttons(button("Add", "btn-primary", onAddEnchant)),
+  );
+
+  // Add a reroll task.
+  const rerollItem = itemSelect();
+  rerollItem.addEventListener("change", () => refreshModList(true));
+  parts.rerollItem = rerollItem;
+
+  const mods = el("select", `form-control form-control-sm ${MARK}-mods`);
+  mods.multiple = true;
+  mods.size = 4;
+  mods.__options = null;
+  parts.rerollMods = mods;
+
+  const addReroll = line();
+  addReroll.append(
+    field("Reroll", rerollItem, true),
+    field("Until it has", mods, true),
+    buttons(button("Add", "btn-primary", onAddReroll)),
+  );
+
+  // The queue itself.
+  const table = el("table", `table table-sm ${MARK}-table`);
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const text of ["Task", "Item", "Goal", "Status", ""]) headRow.append(el("th", null, text));
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  table.append(head, body);
+  parts.queueBody = body;
+  parts.queueKey = "";
+
+  const runButton = button("Start queue", "btn-success", () => {
+    if (job?.type === "queue") endJob("stopped");
+    else startQueue();
+  });
+  parts.queueButton = runButton;
+
+  const controls = line();
+  controls.append(
+    field("Keep essence above", numberInput("essenceFloor")),
+    field("Reroll cap", numberInput("rerollMax", 1)),
+    el("div", `${MARK}-spacer`),
+    buttons(runButton, button("Clear finished", "btn-secondary", clearFinished)),
+  );
+
+  wrap.append(addEnchant, addReroll, table, controls);
+  return wrap;
+}
+
+function onAddEnchant() {
+  const ench = getEnchanting();
+  if (!ench) return;
+
+  const item = findInBank(enchantable(ench), parts.enchantItem.value);
+  if (!item) {
+    setStatus("pick an item to enchant first");
+    return;
+  }
+  const target = Number(parts.enchantGrade.value);
+  if (qualityOf(item) >= target) {
+    setStatus(`${item.name} is already ${qualityName(qualityOf(item))}`);
+    return;
+  }
+
+  addTask({ kind: "enchant", itemID: item.id, itemName: item.name, target });
+  setStatus(`queued: enchant ${item.name} to ${qualityName(target)}`);
+}
+
+function onAddReroll() {
+  const ench = getEnchanting();
+  if (!ench) return;
+
+  const item = findInBank(rerollable(ench), parts.rerollItem.value);
+  if (!item) {
+    setStatus("pick an item to reroll first");
+    return;
+  }
+
+  const modIDs = [...parts.rerollMods.selectedOptions].map((option) => option.value);
+  if (!modIDs.length) {
+    setStatus("pick at least one modifier you want");
+    return;
+  }
+  // Refuse the impossible up front rather than after a few hundred rerolls.
+  if (modIDs.length > item.extraModifiers.size) {
+    setStatus(
+      `${item.name} has only ${item.extraModifiers.size} modifier slot${
+        item.extraModifiers.size === 1 ? "" : "s"
+      } — you picked ${modIDs.length}`,
+    );
+    return;
+  }
+
+  const names = modIDs.map((id) => modName(modByID(ench, id)));
+  addTask({ kind: "reroll", itemID: item.id, itemName: item.name, modIDs, modNames: names });
+  setStatus(`queued: reroll ${item.name} until ${names.join(" + ")}`);
+}
+
+// The modifiers on offer depend on the item: its base type, its grade, and your skill level.
+function refreshModList(force) {
+  const ench = getEnchanting();
+  const node = parts.rerollMods;
+  if (!ench || !node) return;
+
+  const item = findInBank(rerollable(ench), parts.rerollItem.value);
+  const pool = item ? [...ench.getPossibleMods(item.item, item.quality)] : [];
+  pool.sort((a, b) => modName(a).localeCompare(modName(b)));
+
+  const key = pool.map((mod) => mod.id).join(",");
+  if (!force && node.__options === key) return;
+  node.__options = key;
+
+  node.replaceChildren();
+  for (const mod of pool) {
+    const option = document.createElement("option");
+    option.value = mod.id;
+    option.textContent = modName(mod);
+    node.append(option);
+  }
+}
+
+function goalText(task) {
+  if (task.kind === "enchant") return `to ${qualityName(task.target)}`;
+  return (task.modNames ?? task.modIDs ?? []).join(" + ");
+}
+
+function refreshQueueTable() {
+  const body = parts.queueBody;
+  if (!body) return;
+
+  // Rebuild only when something actually changed, so clicking Remove isn't a race with the
+  // 1-second refresh.
+  const key = settings.queue.map((task) => `${task.id}:${task.status}:${task.note}`).join("|");
+  if (parts.queueKey === key) return;
+  parts.queueKey = key;
+
+  body.replaceChildren();
+
+  if (!settings.queue.length) {
+    const row = document.createElement("tr");
+    const cell = el("td", `${MARK}-note`, "Nothing queued yet.");
+    cell.colSpan = 5;
+    row.append(cell);
+    body.append(row);
+    return;
+  }
+
+  for (const task of settings.queue) {
+    const row = document.createElement("tr");
+    row.append(
+      el("td", null, task.kind === "enchant" ? "Enchant" : "Reroll"),
+      el("td", null, task.itemName),
+      el("td", null, goalText(task)),
+      el("td", `${MARK}-${task.status}`, task.note ? `${task.status} — ${task.note}` : task.status),
+    );
+
+    const remove = document.createElement("td");
+    remove.append(button("✕", "btn-secondary", () => removeTask(task.id)));
+    row.append(remove);
+    body.append(row);
+  }
 }
 
 function buildPanel() {
-  const panel = document.createElement("div");
-  panel.className = `block block-rounded ${MARK}-panel`;
+  const panel = el("div", `block block-rounded ${MARK}-panel`);
 
-  const header = document.createElement("div");
-  header.className = "block-header block-header-default";
-  const title = document.createElement("h3");
-  title.className = "block-title";
-  title.textContent = "Auto Enchanting";
-  header.append(title, checkbox("enabled", "Automation enabled"));
+  const header = el("div", "block-header block-header-default");
+  header.append(el("h3", "block-title", "Auto Enchanting"), checkbox("enabled", "Automation enabled"));
 
-  const content = document.createElement("div");
-  content.className = "block-content";
+  const content = el("div", "block-content");
+  content.append(buildLootSection(), buildSweepSection(), buildQueueSection());
 
-  content.append(buildLootRow(), buildDisenchantRow(), buildEnchantRow(), buildRerollRow());
-
-  const status = document.createElement("div");
-  status.className = `${MARK}-status`;
+  const status = el("div", `${MARK}-status`);
   parts.status = status;
   content.append(status);
 
@@ -1130,228 +1514,38 @@ function buildPanel() {
   return panel;
 }
 
-function buildLootRow() {
-  const row = document.createElement("div");
-  row.className = `${MARK}-row`;
-
-  const heading = document.createElement("h4");
-  heading.textContent = "Auto-disenchant new loot";
-  row.append(heading);
-
-  row.append(
-    labelled("Crafting rewards:", gradeSelect("autoDisenchantRewards")),
-    checkbox("includeCommonRewards", "Include Common"),
-    checkbox("downgradeRewards", "Downgrade"),
-  );
-  row.append(
-    labelled("Other drops:", gradeSelect("autoDisenchantDrops")),
-    checkbox("includeCommonDrops", "Include Common"),
-    checkbox("downgradeDrops", "Downgrade"),
-  );
-
-  const note = document.createElement("span");
-  note.className = `${MARK}-note`;
-  note.textContent = "Replaces the Enchanting mod's own auto-disenchant (half XP, as before).";
-  row.append(note);
-  return row;
-}
-
-function buildDisenchantRow() {
-  const row = document.createElement("div");
-  row.className = `${MARK}-row`;
-
-  const heading = document.createElement("h4");
-  heading.textContent = "Disenchant the bank";
-  row.append(heading);
-
-  const mode = document.createElement("select");
-  mode.className = "form-control form-control-sm";
-  for (const [value, text] of [
-    ["skill", "Use the skill (full XP)"],
-    ["instant", "Instant (half XP)"],
-  ]) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = text;
-    mode.append(option);
-  }
-  mode.value = settings.bankDisenchantMode;
-  mode.addEventListener("change", () => {
-    settings.bankDisenchantMode = mode.value;
-    saveSettings();
-    updatePanel();
-  });
-
-  const count = document.createElement("span");
-  count.className = `${MARK}-note`;
-  parts.disenchantCount = count;
-
-  const button = startStop(startDisenchantJob, "disenchant");
-  parts.disenchantButton = button;
-
-  row.append(
-    labelled("Grade and below:", gradeSelect("bankDisenchantGrade")),
-    labelled("Mode:", mode),
-    button,
-    count,
-  );
-  return row;
-}
-
-function buildEnchantRow() {
-  const row = document.createElement("div");
-  row.className = `${MARK}-row`;
-
-  const heading = document.createElement("h4");
-  heading.textContent = "Enchant until";
-  row.append(heading);
-
-  const scope = document.createElement("select");
-  scope.className = "form-control form-control-sm";
-  for (const [value, text] of [
-    ["single", "One item"],
-    ["all", "Everything eligible"],
-  ]) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = text;
-    scope.append(option);
-  }
-  scope.value = settings.enchantScope;
-  scope.addEventListener("change", () => {
-    settings.enchantScope = scope.value;
-    saveSettings();
-    updatePanel();
-  });
-
-  const picker = itemSelect();
-  parts.enchantItem = picker;
-
-  const button = startStop(() => startEnchantJob(pickedEnchantItem()), "enchant");
-  parts.enchantButton = button;
-
-  row.append(
-    labelled("Grade:", gradeSelect("enchantTarget", { includeOff: false, from: 1 })),
-    labelled("Scope:", scope),
-    labelled("Item:", picker),
-    labelled("Keep essence above:", numberInput("essenceFloor")),
-    button,
-  );
-  return row;
-}
-
-function buildRerollRow() {
-  const row = document.createElement("div");
-  row.className = `${MARK}-row`;
-
-  const heading = document.createElement("h4");
-  heading.textContent = "Reroll until";
-  row.append(heading);
-
-  const picker = itemSelect();
-  picker.addEventListener("change", () => updateModList());
-  parts.rerollItem = picker;
-
-  const mods = document.createElement("select");
-  mods.className = `form-control form-control-sm ${MARK}-mods`;
-  mods.multiple = true;
-  mods.addEventListener("change", () => {
-    settings.rerollTargetModIDs = [...mods.selectedOptions].map((option) => option.value);
-    saveSettings();
-  });
-  parts.rerollMods = mods;
-
-  const button = startStop(() => startRerollJob(pickedRerollItem()), "reroll");
-  parts.rerollButton = button;
-
-  const note = document.createElement("span");
-  note.className = `${MARK}-note`;
-  note.textContent = "Stops as soon as every modifier you picked is on the item.";
-
-  row.append(
-    labelled("Item:", picker),
-    labelled("Modifiers you want:", mods),
-    labelled("Reroll cap:", numberInput("rerollMax", { min: 1 })),
-    button,
-    note,
-  );
-  return row;
-}
-
-function pickedEnchantItem() {
-  const ench = getEnchanting();
-  if (!ench) return undefined;
-  const items = enchantTargets(ench, Math.min(settings.enchantTarget, MAX_QUALITY));
-  return itemFromSelect(parts.enchantItem, items);
-}
-
-function pickedRerollItem() {
-  const ench = getEnchanting();
-  if (!ench) return undefined;
-  const items = rerollCandidates(ench);
-  return itemFromSelect(parts.rerollItem, items);
-}
-
-// The modifiers on offer depend on the item: its base type, its grade, and your skill level.
-function updateModList() {
-  const ench = getEnchanting();
-  const select = parts.rerollMods;
-  if (!ench || !select) return;
-
-  const item = pickedRerollItem();
-  const pool = item ? ench.getPossibleMods(item.item, item.quality) : [];
-  const key = pool.map((mod) => mod.id).join(",");
-  if (select.__options === key) return;
-  select.__options = key;
-
-  select.replaceChildren();
-  for (const mod of pool) {
-    const option = document.createElement("option");
-    option.value = mod.id;
-    option.textContent = formatModifierName(mod);
-    option.selected = settings.rerollTargetModIDs.includes(mod.id);
-    select.append(option);
-  }
-}
-
 function updatePanel() {
   if (!panelEl) return;
   const ench = getEnchanting();
   if (!ench) return;
 
-  const running = Boolean(job);
-
   if (parts.enabled) parts.enabled.checked = settings.enabled;
 
-  const disenchantable = disenchantTargets(ench, settings.bankDisenchantGrade).length;
-  if (parts.disenchantCount) {
-    parts.disenchantCount.textContent =
+  const matching = disenchantTargets(ench, settings.bankDisenchantGrade).length;
+  if (parts.sweepCount) {
+    parts.sweepCount.textContent =
       settings.bankDisenchantGrade < 0
         ? "pick a grade"
-        : `${disenchantable} stack${disenchantable === 1 ? "" : "s"} match`;
+        : `${matching} stack${matching === 1 ? "" : "s"} match`;
   }
 
-  refreshItemSelect(
-    parts.enchantItem,
-    enchantTargets(ench, Math.min(settings.enchantTarget, MAX_QUALITY)),
-    "— pick an item —",
-  );
-  parts.enchantItem.disabled = settings.enchantScope !== "single";
+  refreshItemSelect(parts.enchantItem, enchantable(ench));
+  refreshItemSelect(parts.rerollItem, rerollable(ench));
+  refreshModList(false);
+  refreshQueueTable();
 
-  refreshItemSelect(parts.rerollItem, rerollCandidates(ench), "— pick an item —");
-  updateModList();
+  const sweeping = job?.type === "sweep";
+  const queueing = job?.type === "queue";
 
-  for (const [type, button] of [
-    ["disenchant", parts.disenchantButton],
-    ["enchant", parts.enchantButton],
-    ["reroll", parts.rerollButton],
-  ]) {
-    if (!button) continue;
-    const isThisJob = job?.type === type;
-    button.textContent = isThisJob ? "Stop" : "Start";
-    button.className = `btn btn-sm ${isThisJob ? "btn-danger" : "btn-success"}`;
-    // One job at a time: they compete for the skill's action slot, or for the item itself.
-    button.disabled = !settings.enabled || (running && !isThisJob);
+  if (parts.sweepButton) {
+    parts.sweepButton.textContent = sweeping ? "Stop" : "Start";
+    parts.sweepButton.className = `btn btn-sm ${sweeping ? "btn-danger" : "btn-success"}`;
+    parts.sweepButton.disabled = !settings.enabled || queueing;
+  }
+  if (parts.queueButton) {
+    parts.queueButton.textContent = queueing ? "Stop queue" : "Start queue";
+    parts.queueButton.className = `btn btn-sm ${queueing ? "btn-danger" : "btn-success"}`;
+    parts.queueButton.disabled = !settings.enabled || sweeping;
   }
 
   if (parts.status) {
@@ -1393,35 +1587,47 @@ function registerSettings(ctx) {
       hint: "Takes over the Enchanting mod's auto-disenchant. Bulk jobs live on the Enchanting page.",
       default: false,
       onChange: (value) => {
-        if (syncingSettingsSection) return;
-        setEnabled(value);
+        settings.enabled = value;
+        saveSettings();
+        applyTakeover();
+        if (!value) endJob("stopped: automation is off");
+        updatePanel();
       },
     });
-    settings.enabled = readEnabledSetting(settings.enabled);
   } catch (err) {
     warn("could not register settings section", err);
   }
 }
 
-// Mod Settings are per-character and persisted by the game. Keep `enabled` there instead of
-// duplicating it in characterStorage, otherwise the two stores can overwrite each other during
-// load. The rest of the panel-only settings stay in characterStorage.
+// This switch is account-wide but our settings are per-character, so push the loaded
+// character's value into it — otherwise it would show the previous character's state.
 function syncSettingsSection() {
-  settings.enabled = readEnabledSetting(settings.enabled);
+  try {
+    settingsSection?.set?.("enabled", settings.enabled);
+  } catch (err) {
+    warn("could not sync the settings switch", err);
+  }
 }
 
 // ---------------------------------------------------------------------------
 
 export function setup(ctx) {
+  // A fallback handle, so a mod reloaded into an already-running game (which never gets
+  // onCharacterLoaded) can still save. The real one comes from the lifecycle hook below:
+  // the wiki is explicit that character storage isn't available until a character has loaded,
+  // and every hook is handed the context to read it from.
+  storage = ctx.characterStorage ?? null;
+
   registerSettings(ctx);
 
-  ctx.onCharacterLoaded((loadedCtx = ctx) => {
-    storage = loadedCtx.characterStorage ?? ctx.characterStorage ?? storage;
+  ctx.onCharacterLoaded((loadedCtx) => {
+    storage = loadedCtx?.characterStorage ?? storage;
     loadSettings();
+    checkStorage();
     syncSettingsSection();
   });
 
-  ctx.onInterfaceReady((readyCtx = ctx) => {
+  ctx.onInterfaceReady(() => {
     const ench = getEnchanting();
     if (!ench) {
       warn("game.enchanting not found — is the Enchanting mod installed and enabled? Doing nothing.");
@@ -1430,9 +1636,10 @@ export function setup(ctx) {
 
     // A mod reloaded into a running game misses onCharacterLoaded, so settings would still be
     // at their defaults here. Load them if that hook never ran.
-    if (!storage) storage = readyCtx.characterStorage ?? ctx.characterStorage ?? storage;
     if (!settingsLoaded) {
+      storage = ctx.characterStorage ?? storage;
       loadSettings();
+      checkStorage();
       syncSettingsSection();
     }
 
@@ -1450,18 +1657,21 @@ export function setup(ctx) {
         return job;
       },
       stored: () => storage?.getItem?.(STORAGE_KEY),
-      save: () => {
-        writeEnabledSetting(settings.enabled);
-        saveSettings();
-        getGame()?.scheduleSave?.();
-      },
+      save: () => saveSettings(),
+      check: () => checkStorage(),
       stop: () => endJob("stopped by hand"),
       dump() {
-        console.log({ live: settings, stored: this.stored(), hasStorage: !!storage, job });
+        console.log({
+          live: settings,
+          stored: this.stored(),
+          hasStorage: !!storage,
+          storageWorks: checkStorage(),
+          bytes: JSON.stringify(settings).length,
+          job,
+        });
       },
       reset() {
         settings = structuredClone(DEFAULTS);
-        writeEnabledSetting(settings.enabled);
         saveSettings();
         applyTakeover();
         updatePanel();
