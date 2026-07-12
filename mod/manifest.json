@@ -1,0 +1,8 @@
+{
+  "name": "Auto Enchanting",
+  "description": "Bulk operations for the Enchanting mod: disenchant your whole bank by grade, enchant items up to a target grade, and reroll an item until it rolls the modifiers you want. Locked items are always left alone. Also takes over the Enchanting mod's auto-disenchant of new loot so every option lives in one place. Requires the Enchanting mod.",
+  "version": "0.1.2",
+  "setup": "setup.mjs",
+  "load": [],
+  "resources": []
+}
