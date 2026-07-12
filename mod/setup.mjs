@@ -71,7 +71,13 @@ const DEFAULTS = {
 
   // Bank sweep.
   bankDisenchantGrade: OFF,
-  bankDisenchantMode: "skill", // "skill" = full XP, uses the skill | "instant" = half XP, does not
+  bankDisenchantMode: "skill", // "skill" = the real action | "instant" = the loot auto-disenchant path
+
+  // How the queue enchants. "instant" fast-forwards the item up the grades, paying the same
+  // costs and granting the same XP a real action would, but without the ten-second wait or the
+  // action slot. "skill" drives the mod's own Enchant action, which is where every action-slot
+  // and lost-the-item problem comes from — kept because it is the mod's real path.
+  queueMode: "instant",
 
   // The task queue: one entry per item you want enchanted or rerolled.
   // { id, kind: "enchant" | "reroll", itemID, itemName, target?, modIDs?, status, note }
@@ -758,14 +764,19 @@ function driveInstantSweep(ench) {
   setStatus(`instantly disenchanted ${job.done} stack${job.done === 1 ? "" : "s"}…`);
 }
 
-// The Enchanting mod's own instant path (the one it runs on loot) at half XP, but for an item
-// that is already in your bank, so we have to take it out ourselves.
+// The Enchanting mod's own instant path (the one it runs on loot), but for an item that is
+// already in your bank, so we have to take it out ourselves.
 //
-// We don't call its giveAutoDisenchantRewards() here: that computes XP from
-// `this.currentAction.baseXP`, so the XP you'd get would depend on whichever action icon you
-// last clicked on the page. On loot that quirk is the mod's own behaviour and we keep it; for
-// a bank disenchant we spell out what it's supposed to mean instead — half of the XP the
-// Disenchant action would have given.
+// A word on the XP, because it is not what you would guess. The mod's *action* grants a flat
+// baseXP — `rewards.addXP(this, this.currentAction.baseXP)`, 5 for a disenchant, whatever the
+// item's grade or level. Its *auto-disenchant* grants getXPForAction()/2, which scales with both.
+// So for anything much above Common, this instant path pays MORE than doing it by hand, not
+// half. That is the mod's own arithmetic, and mirroring its auto-disenchant is the point of this
+// mode — but it is worth knowing which of the two you are choosing.
+//
+// We don't call its giveAutoDisenchantRewards() directly: that reads `this.currentAction.baseXP`,
+// so the XP would depend on whichever action icon you last clicked on the page. On loot we keep
+// that quirk (it is the mod's behaviour); here we spell out what it means.
 function instantDisenchant(ench, item, qty) {
   const game = getGame();
   const RewardsClass = getRewardsClass();
@@ -931,7 +942,90 @@ function driveQueue(ench) {
   else driveRerollTask(ench, task);
 }
 
+// What one completed Enchant action grants. Note this is a FLAT baseXP — the Enchanting mod's
+// page displays getXPForAction() (grade x item level), but its action() grants
+// currentActionRewards, which is `rewards.addXP(this, this.currentAction.baseXP)` and nothing
+// else. Fast-forwarding has to pay what the action pays, not what the page claims.
+function grantEnchantStep(ench, item, made) {
+  const game = getGame();
+  const RewardsClass = getRewardsClass();
+  const action = actionByID(ench, ENCHANT);
+  if (!RewardsClass || !action) return false;
+
+  const rewards = new RewardsClass(game);
+  rewards.setSource(`Skill.${ench.id}`);
+  rewards.addXP(ench, action.baseXP);
+  rewards.addItem(made, 1);
+
+  // Rewards first, then costs — the same order action() uses, so a full bank fails the same way
+  // rather than eating the item.
+  if (rewards.giveRewards()) return false;
+  return true;
+}
+
+// Fast-forward the item to its target grade: for every grade, create the item the mod's own
+// factory would have created, pay the costs the action would have paid, and grant the XP the
+// action would have granted. The only thing skipped is the ten-second wait.
+//
+// This sidesteps the entire class of bugs that came with driving the real action: nothing takes
+// the action slot away from your combat, nothing self-restarts on the wrong item, and there is
+// no gap between "the mod made an item" and "we worked out which one" — we hold it.
+function instantEnchantTask(ench, task) {
+  const target = Math.min(task.target, MAX_QUALITY);
+
+  for (let step = 0; step < MAX_QUALITY; step += 1) {
+    const item = job.item;
+    if (qualityOf(item) >= target) {
+      finishTask(task, "done", `now ${qualityName(target)}`);
+      return;
+    }
+    if (isLocked(item)) {
+      finishTask(task, "failed", "the item is locked");
+      return;
+    }
+
+    const costs = ench.getEnchantCosts(item);
+    if (ench.isCostEmpty(costs)) {
+      finishTask(task, "failed", "can't be enchanted any further");
+      return;
+    }
+    if (!costs.checkIfOwned()) {
+      finishTask(task, "failed", "not enough essence");
+      return;
+    }
+    if (belowEssenceFloor(costs)) {
+      finishTask(task, "failed", `would take an essence below your floor of ${settings.essenceFloor}`);
+      return;
+    }
+
+    // Exactly what addCurrentActionRewards() builds for an Enchant.
+    const made = ench.isAugmentedItem(item)
+      ? ench.createEnchantingItem(item.item, qualityOf(item) + 1, item.extraModifiers, item.extraSpecials)
+      : ench.createEnchantingItem(item, 1);
+    if (made === undefined) {
+      finishTask(task, "failed", "the Enchanting mod could not make the next grade");
+      return;
+    }
+
+    if (!grantEnchantStep(ench, item, made)) {
+      finishTask(task, "failed", "the bank is full");
+      return;
+    }
+    costs.consumeCosts(); // takes the old item and the essence
+
+    adoptItem(task, made);
+    ench.queueBankQuantityRender?.(made);
+  }
+
+  finishTask(task, "done", `now ${qualityName(qualityOf(job.item))}`);
+}
+
 function driveEnchantTask(ench, task) {
+  if (settings.queueMode === "instant") {
+    instantEnchantTask(ench, task);
+    return;
+  }
+
   if (ench.isActive) return; // an enchant is running; the action hook takes it from here
 
   const item = job.item;
@@ -1183,6 +1277,11 @@ function injectStyles() {
     }
     .${MARK}-cell img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
     .${MARK}-cell:hover { border-color: var(--bs-primary, #4c84ff); transform: scale(1.08); background: rgba(255,255,255,.1); }
+    .${MARK}-cell.${MARK}-chosen {
+      border-color: var(--bs-success, #5cb85c);
+      background: rgba(92, 184, 92, .28);
+      box-shadow: inset 0 0 0 1px var(--bs-success, #5cb85c);
+    }
     .${MARK}-cell-qty {
       position: absolute; right: 2px; bottom: 1px;
       font-size: 10px; font-weight: 600; line-height: 1;
@@ -1328,11 +1427,28 @@ function button(label, className, onClick) {
 
 const PAGE_SIZE = 300;
 
-// The item each picker currently holds. Not persisted — it's what the next Add will use, not a
-// setting. Keyed by id as well, so we can tell when the bank has moved on from it.
-const picked = { enchant: null, reroll: null };
+// The items each picker currently holds. Not persisted — it's what the next Add will use, not a
+// setting. Arrays, because one goal ("up to Mythic", "until it has Accuracy") usually applies to
+// a whole handful of items and queueing them one at a time is the tedium this mod exists to fix.
+const picked = { enchant: [], reroll: [] };
 
 let picker = null; // the overlay, built once on first open
+
+// An item already waiting in the queue shouldn't be offered again — queueing it twice would
+// have the second task chasing an item the first one already consumed.
+function isQueued(item) {
+  return settings.queue.some(
+    (task) => task.itemID === item.id && (task.status === "pending" || task.status === "running"),
+  );
+}
+
+function pickableForEnchant(ench) {
+  return enchantable(ench).filter((item) => !isQueued(item));
+}
+
+function pickableForReroll(ench) {
+  return rerollable(ench).filter((item) => !isQueued(item));
+}
 
 function itemMedia(item) {
   return item?.media ?? "";
@@ -1386,7 +1502,7 @@ function buildPicker() {
   overlay.append(panel);
 
   const bar = el("div", `${MARK}-picker-bar`);
-  const title = el("h3", "block-title", "Pick an item");
+  const title = el("h3", "block-title", "Pick items");
 
   const search = el("input", `form-control form-control-sm ${MARK}-search`);
   search.type = "search";
@@ -1396,8 +1512,23 @@ function buildPicker() {
     renderPicker();
   });
 
-  const close = button("Close", "btn-secondary", closePicker);
-  bar.append(title, search, close);
+  // "Add all" is just "select everything you can currently see" — so it obeys the search, which
+  // is what makes it useful: type "Fury", select all, done.
+  const selectAll = button("Select all shown", "btn-info", () => {
+    for (const item of pickerMatches()) picker.selected.add(item);
+    renderPicker();
+  });
+  const clear = button("Clear", "btn-secondary", () => {
+    picker.selected.clear();
+    renderPicker();
+  });
+  const done = button("Done", "btn-success", () => {
+    const chosen = [...picker.selected];
+    closePicker();
+    picker.onPick?.(chosen);
+  });
+
+  bar.append(title, search, selectAll, clear, done);
 
   const grid = el("div", `${MARK}-grid`);
 
@@ -1434,16 +1565,30 @@ function buildPicker() {
   grid.addEventListener("click", (event) => {
     const item = event.target?.closest?.(`.${MARK}-cell`)?.__item;
     if (!item) return;
-    tip.hidden = true;
-    picker.onPick?.(item);
-    closePicker();
+    if (picker.selected.has(item)) picker.selected.delete(item);
+    else picker.selected.add(item);
+    renderPicker();
   });
 
   panel.append(bar, grid, pager);
   overlay.append(tip);
   document.body.append(overlay);
 
-  picker = { overlay, title, search, grid, hint, prev, next, tip, items: [], page: 0, onPick: null };
+  picker = {
+    overlay,
+    title,
+    search,
+    grid,
+    hint,
+    prev,
+    next,
+    tip,
+    done,
+    items: [],
+    selected: new Set(),
+    page: 0,
+    onPick: null,
+  };
   return picker;
 }
 
@@ -1487,24 +1632,30 @@ function renderPicker() {
     cell.append(qty);
 
     if (ench?.isAugmentedItem?.(item)) cell.classList.add(`${MARK}-q${qualityOf(item)}`);
+    if (picker.selected.has(item)) cell.classList.add(`${MARK}-chosen`);
     return cell;
   });
 
   picker.grid.replaceChildren(...cells);
+
+  const count = picker.selected.size;
   picker.hint.textContent = matches.length
-    ? `${matches.length} item${matches.length === 1 ? "" : "s"} · page ${picker.page + 1} of ${pages}`
+    ? `${matches.length} item${matches.length === 1 ? "" : "s"} · page ${picker.page + 1} of ${pages}` +
+      (count ? ` · ${count} selected` : "")
     : "nothing eligible";
+  picker.done.textContent = count ? `Done (${count})` : "Done";
   picker.prev.disabled = picker.page === 0;
   picker.next.disabled = picker.page >= pages - 1;
 }
 
-function openPicker(title, items, onPick) {
+function openPicker(title, items, selection, onPick) {
   if (!picker) buildPicker();
   picker.items = items;
   picker.onPick = onPick;
   picker.page = 0;
   picker.title.textContent = title;
   picker.search.value = "";
+  picker.selected = new Set(selection.filter((item) => items.includes(item)));
   picker.overlay.hidden = false;
   renderPicker();
   picker.search.focus?.();
@@ -1523,14 +1674,14 @@ function pickerButton(slot, title, itemsFor) {
 
   const img = document.createElement("img");
   img.className = `${MARK}-pick-img`;
-  const label = el("span", null, "Pick an item");
+  const label = el("span", null, "Pick items");
   node.append(img, label);
 
   node.addEventListener("click", () => {
     const ench = getEnchanting();
     if (!ench) return;
-    openPicker(title, itemsFor(ench), (item) => {
-      picked[slot] = item;
+    openPicker(title, itemsFor(ench), picked[slot], (items) => {
+      picked[slot] = items;
       if (slot === "reroll") refreshModList(true);
       updatePanel();
     });
@@ -1541,21 +1692,27 @@ function pickerButton(slot, title, itemsFor) {
   return node;
 }
 
-// The pick is an item object; the bank can move on from it (you enchanted it, you sold it), so
-// re-resolve it by id every refresh and drop it if it's gone.
+// The picks are item objects, and the bank can move on from them (you enchanted one, you queued
+// one, you sold one), so re-resolve them by id every refresh and drop the ones that are gone.
 function refreshPick(ench, slot, node, items) {
   if (!node) return;
-  const current = picked[slot];
-  if (current) picked[slot] = findInBank(items, current.id) ?? null;
 
-  const item = picked[slot];
-  node.__img.src = item ? itemMedia(item) : "";
-  node.__img.hidden = !item;
-  node.__label.textContent = item
-    ? `${item.name} (${getBank()?.getQty?.(item) ?? 0})`
-    : items.length
-      ? "Pick an item"
-      : "Nothing eligible";
+  picked[slot] = picked[slot]
+    .map((item) => findInBank(items, item.id))
+    .filter((item) => item !== undefined);
+
+  const chosen = picked[slot];
+  const only = chosen.length === 1 ? chosen[0] : null;
+
+  node.__img.src = only ? itemMedia(only) : "";
+  node.__img.hidden = !only;
+  node.__label.textContent = only
+    ? `${only.name} (${getBank()?.getQty?.(only) ?? 0})`
+    : chosen.length
+      ? `${chosen.length} items selected`
+      : items.length
+        ? "Pick items"
+        : "Nothing eligible";
   node.disabled = !items.length;
 }
 
@@ -1624,8 +1781,8 @@ function buildSweepSection() {
       "Mode",
       select(
         [
-          ["skill", "Use the skill (full XP)"],
-          ["instant", "Instant (half XP)"],
+          ["skill", "Use the skill (0.5s each)"],
+          ["instant", "Instant (auto-disenchant XP)"],
         ],
         settings.bankDisenchantMode,
         (value) => {
@@ -1653,7 +1810,7 @@ function buildQueueSection() {
   const wrap = section("Task queue");
 
   // Add an enchant task.
-  const enchantItem = pickerButton("enchant", "Pick an item to enchant", (ench) => enchantable(ench));
+  const enchantItem = pickerButton("enchant", "Pick items to enchant", pickableForEnchant);
   parts.enchantItem = enchantItem;
 
   // Not persisted: it's what the next Add will use, not a setting.
@@ -1668,7 +1825,7 @@ function buildQueueSection() {
   );
 
   // Add a reroll task.
-  const rerollItem = pickerButton("reroll", "Pick an item to reroll", (ench) => rerollable(ench));
+  const rerollItem = pickerButton("reroll", "Pick items to reroll", pickableForReroll);
   parts.rerollItem = rerollItem;
 
   const mods = el("select", `form-control form-control-sm ${MARK}-mods`);
@@ -1703,6 +1860,21 @@ function buildQueueSection() {
 
   const controls = line();
   controls.append(
+    field(
+      "Enchant by",
+      select(
+        [
+          ["instant", "Fast-forward (same cost and XP)"],
+          ["skill", "Use the skill (10s per grade)"],
+        ],
+        settings.queueMode,
+        (value) => {
+          settings.queueMode = value;
+          saveSettings();
+          updatePanel();
+        },
+      ),
+    ),
     field("Keep essence above", numberInput("essenceFloor")),
     field("Reroll cap", numberInput("rerollMax", 1)),
     el("div", `${MARK}-spacer`),
@@ -1713,32 +1885,44 @@ function buildQueueSection() {
   return wrap;
 }
 
+// One goal, however many items: "up to Mythic" applies to every item you picked.
 function onAddEnchant() {
   const ench = getEnchanting();
   if (!ench) return;
 
-  const item = picked.enchant && findInBank(enchantable(ench), picked.enchant.id);
-  if (!item) {
-    setStatus("pick an item to enchant first");
+  const items = picked.enchant;
+  if (!items.length) {
+    setStatus("pick at least one item to enchant");
     return;
   }
   const target = Number(parts.enchantGrade.value);
-  if (qualityOf(item) >= target) {
-    setStatus(`${item.name} is already ${qualityName(qualityOf(item))}`);
-    return;
+
+  let added = 0;
+  let skipped = 0;
+  for (const item of items) {
+    if (isQueued(item) || qualityOf(item) >= target) {
+      skipped += 1;
+      continue;
+    }
+    addTask({ kind: "enchant", itemID: item.id, itemName: item.name, target });
+    added += 1;
   }
 
-  addTask({ kind: "enchant", itemID: item.id, itemName: item.name, target });
-  setStatus(`queued: enchant ${item.name} to ${qualityName(target)}`);
+  picked.enchant = []; // they're in the queue now, and the picker stops offering them
+  setStatus(
+    `queued ${added} enchant task${added === 1 ? "" : "s"} to ${qualityName(target)}` +
+      (skipped ? ` (${skipped} skipped — already queued or already there)` : ""),
+  );
+  updatePanel();
 }
 
 function onAddReroll() {
   const ench = getEnchanting();
   if (!ench) return;
 
-  const item = picked.reroll && findInBank(rerollable(ench), picked.reroll.id);
-  if (!item) {
-    setStatus("pick an item to reroll first");
+  const items = picked.reroll;
+  if (!items.length) {
+    setStatus("pick at least one item to reroll");
     return;
   }
 
@@ -1747,29 +1931,48 @@ function onAddReroll() {
     setStatus("pick at least one modifier you want");
     return;
   }
-  // Refuse the impossible up front rather than after a few hundred rerolls.
-  if (modIDs.length > item.extraModifiers.size) {
-    setStatus(
-      `${item.name} has only ${item.extraModifiers.size} modifier slot${
-        item.extraModifiers.size === 1 ? "" : "s"
-      } — you picked ${modIDs.length}`,
-    );
-    return;
+  const names = modIDs.map((id) => modName(modByID(ench, id)));
+
+  let added = 0;
+  let skipped = 0;
+  for (const item of items) {
+    // Refuse the impossible up front rather than after a few hundred rerolls: an item can only
+    // hold what it has slots for, and can only roll what its base and grade allow.
+    const canRoll = ench.getPossibleMods(item.item, item.quality);
+    const fits =
+      modIDs.length <= item.extraModifiers.size &&
+      modIDs.every((id) => canRoll.some((mod) => mod.id === id));
+
+    if (!fits || isQueued(item)) {
+      skipped += 1;
+      continue;
+    }
+    addTask({ kind: "reroll", itemID: item.id, itemName: item.name, modIDs, modNames: names });
+    added += 1;
   }
 
-  const names = modIDs.map((id) => modName(modByID(ench, id)));
-  addTask({ kind: "reroll", itemID: item.id, itemName: item.name, modIDs, modNames: names });
-  setStatus(`queued: reroll ${item.name} until ${names.join(" + ")}`);
+  picked.reroll = [];
+  setStatus(
+    `queued ${added} reroll task${added === 1 ? "" : "s"} for ${names.join(" + ")}` +
+      (skipped ? ` (${skipped} skipped — can't hold those, or already queued)` : ""),
+  );
+  updatePanel();
 }
 
-// The modifiers on offer depend on the item: its base type, its grade, and your skill level.
+// The modifiers on offer depend on the item: its base type, its grade, and your skill level. So
+// with several items picked, offer only what EVERY one of them can actually roll — anything else
+// would be a goal some of them could never reach.
 function refreshModList(force) {
   const ench = getEnchanting();
   const node = parts.rerollMods;
   if (!ench || !node) return;
 
-  const item = picked.reroll;
-  const pool = item ? [...ench.getPossibleMods(item.item, item.quality)] : [];
+  const items = picked.reroll;
+  let pool = items.length ? [...ench.getPossibleMods(items[0].item, items[0].quality)] : [];
+  for (const item of items.slice(1)) {
+    const canRoll = ench.getPossibleMods(item.item, item.quality);
+    pool = pool.filter((mod) => canRoll.includes(mod));
+  }
   pool.sort((a, b) => modName(a).localeCompare(modName(b)));
 
   const key = pool.map((mod) => mod.id).join(",");

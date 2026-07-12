@@ -480,17 +480,37 @@ const enchantGradeSelect = controlIn(queueSection, "Up to");
 const rerollPickButton = controlIn(queueSection, "Reroll");
 const rerollModsSelect = controlIn(queueSection, "Until it has");
 
-// Picking an item the way you would: click the button, find the icon in the grid, click it.
-// The overlay is built lazily on first open and appended to document.body.
-const pickItem = (pickButton, item) => {
+// Picking items the way you would: click the button to open the grid, click each icon to select
+// it, then Done. The overlay is built lazily on first open and appended to document.body.
+const openPicker = (pickButton) => {
   pickButton.fire("click");
   const overlay = document.body.children.at(-1);
   const grid = walk(overlay).find((node) => node.classList.contains("auto-enchanting-grid"));
-  const cell = grid.children.find((node) => node.__item === item);
-  if (!cell) throw new Error(`no cell in the picker grid for ${item.name} (${item.id})`);
-  grid.fire("click", { target: cell });
-  return { overlay, grid, cell };
+  const buttonNamed = (text) =>
+    walk(overlay).find((node) => node.tag === "button" && node.textContent.startsWith(text));
+  return {
+    overlay,
+    grid,
+    done: buttonNamed("Done"),
+    selectAll: buttonNamed("Select all"),
+    clear: buttonNamed("Clear"),
+  };
 };
+
+const pickItems = (pickButton, ...items) => {
+  const ui = openPicker(pickButton);
+  ui.clear.fire("click"); // cells toggle, so start from nothing selected
+  for (const item of items) {
+    const cell = ui.grid.children.find((node) => node.__item === item);
+    if (!cell) throw new Error(`no cell in the picker grid for ${item.name} (${item.id})`);
+    ui.grid.fire("click", { target: cell });
+  }
+  ui.cell = ui.grid.children.find((node) => node.__item === items[0]);
+  ui.done.fire("click");
+  return ui;
+};
+
+const pickItem = (pickButton, item) => pickItems(pickButton, item);
 
 check("the panel mounts under the skill header", container.children.length === 1);
 check("every section is built", !!lootSection && !!sweepSection && !!queueSection);
@@ -688,6 +708,10 @@ bank.items.set(platebody, 3);
 for (const essence of ESSENCE) bank.items.set(essence, 500);
 
 api.settings.essenceFloor = 0;
+// Sections 6 and 7 are about driving the mod's REAL Enchant action — its self-restarting loop,
+// the item it hands back, the action slot. The queue defaults to fast-forwarding instead (see
+// section 6c), so ask for the skill path explicitly here.
+api.settings.queueMode = "skill";
 api.save();
 
 // Picking goes through the icon grid, and the grid is where the item's details live: several
@@ -818,6 +842,93 @@ await step();
 
 check("it refuses to spend past the essence floor", bank.getQty(ESSENCE[0]) === 60, `common=${bank.getQty(ESSENCE[0])}`);
 check("and says why", api.settings.queue[0]?.status === "failed", api.settings.queue[0]?.note);
+
+// ===========================================================================
+// 6c. Fast-forwarding — the default.
+//
+// Rather than drive the mod's ten-second action, walk the grades ourselves: make the item the
+// mod's own factory would have made, pay the costs the action would have paid, grant the XP the
+// action would have granted. Nothing touches the action slot, so nothing can lose the item.
+//
+// The XP is the point of the check below. A completed Enchant action grants a FLAT baseXP —
+// `rewards.addXP(this, this.currentAction.baseXP)` — not the grade-scaled number the mod's own
+// page displays. Fast-forwarding must pay what the action pays, or it is a buff, not a shortcut.
+// ===========================================================================
+clearButton.fire("click");
+bank.items.clear();
+enchanting.equipment.allObjects.length = 0;
+bank.items.set(platebody, 2);
+for (const essence of ESSENCE) bank.items.set(essence, 500);
+
+api.settings.essenceFloor = 0;
+api.settings.queueMode = "instant";
+api.save();
+
+const xpBeforeFF = enchanting.xp;
+globalThis.game.activeAction = { name: "Combat" }; // fast-forward must not care
+
+pickItem(enchantPickButton, platebody);
+enchantGradeSelect.value = "3"; // Epic: three grades in one go
+addEnchantButton.fire("click");
+startQueueButton.fire("click");
+await step();
+
+const ffTask = api.settings.queue[0];
+const ffItem = enchanting.equipment.allObjects.find((i) => i.item === platebody && i.quality === 3);
+
+check("fast-forward reaches the target without a single action", ffTask.status === "done", `${ffTask.status} — ${ffTask.note}`);
+check("the item exists at the target grade", bank.getQty(ffItem) === 1, `qty=${bank.getQty(ffItem)}`);
+check("the task ends up holding it", ffTask.itemID === ffItem.id);
+check("the rest of the stack is untouched", bank.getQty(platebody) === 1, `plain=${bank.getQty(platebody)}`);
+check("nothing is stranded at the grades in between", bank.getQty(enchanting.equipment.allObjects.find((i) => i.item === platebody && i.quality === 2)) === 0);
+check(
+  "it pays exactly what three real actions would: 3 x flat baseXP",
+  enchanting.xp - xpBeforeFF === ENCHANT_ACTION.baseXP * 3,
+  `xp=${enchanting.xp - xpBeforeFF}`,
+);
+check("it never touched the action slot", globalThis.game.activeAction?.name === "Combat" && !enchanting.isActive);
+
+globalThis.game.activeAction = undefined;
+
+// One goal, many items. Picking is multi-select, so "up to Epic" can be aimed at a handful of
+// items at once — queueing them one at a time is the tedium this mod exists to remove.
+clearButton.fire("click");
+api.settings.queue = [];
+bank.items.clear();
+enchanting.equipment.allObjects.length = 0;
+bank.items.set(platebody, 1);
+bank.items.set(helmet, 1);
+const spare = enchanting.createEnchantingItem(helmet, 2, new Set([MODS[0], MODS[1]]));
+bank.items.set(spare, 1);
+for (const essence of ESSENCE) bank.items.set(essence, 500);
+
+pickItems(enchantPickButton, platebody, helmet, spare);
+enchantGradeSelect.value = "4"; // Legendary
+addEnchantButton.fire("click");
+
+check("picking three items queues three tasks", api.settings.queue.length === 3, `queued=${api.settings.queue.length}`);
+check("all of them share the one goal", api.settings.queue.every((task) => task.target === 4));
+check(
+  "and Select all takes everything the search shows",
+  (() => {
+    api.settings.queue = [];
+    const ui = openPicker(enchantPickButton);
+    ui.clear.fire("click");
+    ui.selectAll.fire("click");
+    ui.done.fire("click");
+    addEnchantButton.fire("click");
+    return api.settings.queue.length === 3;
+  })(),
+  `queued=${api.settings.queue.length}`,
+);
+
+// A queued item is not offered again — queueing it twice would leave the second task chasing an
+// item the first one already consumed.
+const stillOffered = openPicker(enchantPickButton).grid.children.length;
+check("items already in the queue are no longer offered in the picker", stillOffered === 0, `offered=${stillOffered}`);
+
+api.settings.queue = [];
+api.save();
 
 // ===========================================================================
 // 7. The queue: reroll until the modifiers you want.

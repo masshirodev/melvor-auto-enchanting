@@ -2,6 +2,26 @@
 
 ## 0.1.2 - A task queue, and a panel that reads like one
 
+- **Enchant tasks fast-forward by default.** Instead of driving the mod's ten-second Enchant
+  action and then working out what it did, the item is walked up the grades directly: make the
+  item the mod's own factory would have made, pay the costs the action would have paid, grant the
+  XP the action would have granted. Every enchant failure so far came from driving the real
+  action — the action-slot fight, the loop that restarts itself on the wrong item, the gap
+  between "the mod made an item" and "which one was it". None of that exists when we hold the
+  item ourselves. `Use the skill` is still there if you want the real path.
+- **XP correction, and it was wrong in the docs before.** A completed Enchant or Disenchant
+  *action* grants a **flat baseXP** (10 / 5), whatever the grade or item level — the
+  grade-scaled number the mod shows on its page is only ever displayed, never paid. The scaled
+  number is really paid in exactly one place: the auto-disenchant on loot, at half. So instant
+  bank disenchanting pays *more* XP than doing it by hand, not "half", and the mode labels said
+  the opposite. Fast-forwarding an enchant pays the flat 10/grade a real action pays — a
+  shortcut, not a buff.
+- **Pick several items at once.** The grid is multi-select, with **Select all shown** (which
+  obeys the search, so: type "Fury", select all, done). One goal — "up to Mythic", "until it has
+  Accuracy" — is then applied to every item you picked, queueing one task each. For reroll, only
+  the modifiers *every* selected item can actually roll are offered.
+- **Queued items leave the picker.** Offering an item that's already queued only invited a second
+  task to chase an item the first one had already consumed.
 - **Items are picked from an icon grid, not a dropdown.** Clicking a picker opens a searchable,
   paged grid of icons — the same shape as requirement-filler's item adder. Grades colour
   themselves for free: an enchanted item's `media` already ends in `#q=<grade>`, which the

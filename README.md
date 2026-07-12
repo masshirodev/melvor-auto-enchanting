@@ -17,8 +17,9 @@ auto-disenchant panel for new loot.
 | **Automation enabled** | off | Master switch. When on, the native Enchanting auto-disenchant UI is hidden and controlled here. |
 | **Auto-disenchant new loot** | off | Replaces the Enchanting mod's auto-disenchant for crafting rewards and other drops. Same half-XP behavior as the original. |
 | **Disenchant the bank** | off | Disenchants all unlocked enchanted bank stacks at or below a chosen grade. **Spends the item stacks you selected by grade.** |
-| **Bank disenchant mode** | skill | `Use the skill` gives full XP and uses the Enchanting action slot. `Instant` gives half XP and does not use the action slot. |
-| **Task queue** | empty | Enchant and reroll jobs are queued per item: pick an item, set the goal, press **Add**. **Start queue** works through them in order, one at a time. |
+| **Bank disenchant mode** | skill | `Use the skill` drives the real Disenchant action, half a second per item, and takes the action slot. `Instant` doesn't, and pays the auto-disenchant XP instead (see the note below). |
+| **Task queue** | empty | Enchant and reroll jobs are queued per item: pick items from the grid, set one goal for all of them, press **Add**. **Start queue** works through them in order. |
+| **Enchant by** | fast-forward | `Fast-forward` walks the item up the grades itself, paying the same costs and the same XP a real action would, without the 10s wait or the action slot. `Use the skill` drives the mod's real Enchant action instead. |
 | **Keep essence above** | 0 | Hard floor across every task; a task fails rather than take an essence below this. |
 | **Reroll cap** | 500 | How many rerolls a single task may pay for before giving up. |
 
@@ -47,14 +48,24 @@ the native row. Turning Auto Enchanting off restores those fields.
 
 Bank disenchant has two modes:
 
-- **Use the skill (full XP):** selects the Enchanting mod's Disenchant action and lets the skill
-  drain each matching stack normally. Enchanting claims the action slot, so this stops whatever
-  else you were doing — exactly as if you had clicked Disenchant yourself. That decision is the
-  game's, made by its own `idleChecker`; if it turns us down (its "stop what you're doing?"
-  prompt is waiting on you), the job stops cleanly rather than stacking modals.
-- **Instant (half XP):** mirrors the Enchanting mod's own loot auto-disenchant reward path, but
-  applies it to existing bank stacks. It removes the item first so the freed bank slot can hold
-  the essence.
+- **Use the skill:** selects the Enchanting mod's Disenchant action and lets the skill drain each
+  matching stack normally, half a second at a time. Enchanting claims the action slot, so this
+  stops whatever else you were doing — exactly as if you had clicked Disenchant yourself. That
+  decision is the game's, made by its own `idleChecker`; if it turns us down (its "stop what
+  you're doing?" prompt is waiting on you), the job stops cleanly rather than stacking modals.
+- **Instant:** mirrors the Enchanting mod's own loot auto-disenchant reward path, but applies it
+  to existing bank stacks. It removes the item first so the freed bank slot can hold the essence.
+  No action slot, hundreds of stacks in one pass.
+
+> **A word on Enchanting XP, because it is not what you'd guess.** A completed Enchant or
+> Disenchant *action* grants a **flat `baseXP`** — 10 and 5 — whatever the item's grade or level:
+> `rewards.addXP(this, this.currentAction.baseXP)`. The grade-and-level-scaled number the mod
+> shows you on its own page (`getXPForAction`) is only ever *displayed*; the action doesn't pay
+> it. The one place that number is really paid is the **auto-disenchant** on loot, at half.
+> So instant bank disenchanting usually pays **more** XP than doing it by hand, not less — that's
+> the mod's own arithmetic, and mirroring its auto-disenchant path is the point of that mode.
+> Fast-forwarding an enchant, by contrast, pays exactly what the real actions would: flat 10 per
+> grade. It is a shortcut, not a buff.
 
 Enchanting uses the real Enchant action. The mod stops after each completed action and follows
 the newly created item object to the next grade, instead of letting the Enchanting mod keep
