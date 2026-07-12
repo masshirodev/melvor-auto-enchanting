@@ -45,8 +45,10 @@ the native row. Turning Auto Enchanting off restores those fields.
 Bank disenchant has two modes:
 
 - **Use the skill (full XP):** selects the Enchanting mod's Disenchant action and lets the skill
-  drain each matching stack normally. It refuses to run if another skill or combat owns the
-  action slot.
+  drain each matching stack normally. Enchanting claims the action slot, so this stops whatever
+  else you were doing — exactly as if you had clicked Disenchant yourself. That decision is the
+  game's, made by its own `idleChecker`; if it turns us down (its "stop what you're doing?"
+  prompt is waiting on you), the job stops cleanly rather than stacking modals.
 - **Instant (half XP):** mirrors the Enchanting mod's own loot auto-disenchant reward path, but
   applies it to existing bank stacks. It removes the item first so the freed bank slot can hold
   the essence.

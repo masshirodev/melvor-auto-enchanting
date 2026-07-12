@@ -202,6 +202,7 @@ globalThis.Rewards = class {
 
 let itemCounter = 0;
 let localizeCalls = 0;
+let refuseStart = false; // stands in for the game's idleChecker turning us down
 
 class FakeEnchanting {
   constructor() {
@@ -342,8 +343,11 @@ class FakeEnchanting {
     this.selectedItem = item;
   }
 
+  // The real start() defers to the game's idleChecker: with stop-confirmations off it simply
+  // takes the action slot from whatever held it, and with them on it refuses and puts a prompt
+  // on screen. Both are the game's call, so both are modelled here.
   start() {
-    if (globalThis.game.activeAction !== undefined && globalThis.game.activeAction !== this) return false;
+    if (refuseStart) return false;
     this.isActive = true;
     globalThis.game.activeAction = this;
     return true;
@@ -596,18 +600,25 @@ api.settings.bankDisenchantMode = "skill";
 api.settings.bankDisenchantGrade = 2;
 api.save();
 
+// Starting a disenchant while you're doing something else is the GAME's call, made by its own
+// idleChecker — exactly as if you'd clicked the button yourself. We don't second-guess it.
 const otherSkill = { name: "Woodcutting" };
 globalThis.game.activeAction = otherSkill;
+refuseStart = true; // the game says no (its "stop what you're doing?" prompt is up)
 sweepButton.fire("click");
 await step();
 check(
-  "it won't touch the skill while something else is using it",
-  api.job === null && globalThis.game.activeAction === otherSkill,
+  "if the game refuses to start, the job stops cleanly",
+  api.job === null && globalThis.game.activeAction === otherSkill && !enchanting.isActive,
 );
 
-globalThis.game.activeAction = undefined;
+refuseStart = false; // the game says yes, and takes the slot from whatever held it
 sweepButton.fire("click");
 await step();
+check(
+  "if the game allows it, the disenchant takes the action slot",
+  globalThis.game.activeAction === enchanting,
+);
 check("with the slot free it starts the skill on the right item", enchanting.isActive && enchanting.selectedItem === plateA);
 check("and on the Disenchant action", enchanting.selectedAction === DISENCHANT_ACTION);
 

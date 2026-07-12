@@ -20,6 +20,12 @@
   item it actually holds, so Stop/Start resumes where it left off. The adoption happens
   synchronously inside the action hook, so even a Stop landing between an enchant completing and
   our callback running leaves the task pointing at an item that exists.
+- **Fixed: the bank sweep refused to start while you were doing anything else.** It checked
+  `game.activeAction` itself and gave up — so with combat running, "990 stacks match" turned into
+  "stopped: another skill or combat is using the action slot" and nothing happened. Whether an
+  Enchanting action may take the slot is the *game's* call, made by its own `idleChecker`, so we
+  now just start it, exactly as if you had clicked the button. If the game turns us down, the job
+  stops cleanly instead of retrying and stacking modals on you.
 - **Says out loud when settings can't persist.** An unlinked local mod saves nothing — Melvor
   requires a local mod to be linked to mod.io and installed from there before any Mod Settings or
   character storage is written, and until then every `setItem` is silently dropped. The mod now

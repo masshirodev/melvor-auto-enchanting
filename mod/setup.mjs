@@ -585,16 +585,13 @@ function endJob(reason) {
   updatePanel();
 }
 
-// Enchant and Disenchant claim game.activeAction. Calling start() while combat or another
-// skill owns it would pop the game's own "stop what you're doing?" modal at you, so we check
-// first and never get there.
-function skillSlotFree(ench) {
-  const active = getGame()?.activeAction;
-  return active === undefined || active === ench;
-}
-
 // Mirrors what clicking an action icon, then an item, then the big button does — minus the
 // toggle behaviour of actionButtonOnClick(), which would *stop* a running action.
+//
+// We do NOT check game.activeAction first. Enchant and Disenchant claim that slot, so starting
+// one while you are fighting or woodcutting means stopping what you were doing — but that is
+// the game's call to make, through its own idleChecker, exactly as if you had clicked the
+// button yourself. If it refuses, start() returns false and the caller stops the job.
 function startSkillAction(ench, actionID, item) {
   if (ench.isActive) return false;
 
@@ -681,10 +678,6 @@ function driveSweep(ench) {
     return;
   }
 
-  if (!skillSlotFree(ench)) {
-    endJob("stopped: another skill or combat is using the action slot");
-    return;
-  }
   // Its own action() loop is draining the current stack; let it.
   if (ench.isActive) return;
 
@@ -696,7 +689,9 @@ function driveSweep(ench) {
   }
 
   if (!startSkillAction(ench, DISENCHANT, next)) {
-    endJob(`stopped: could not disenchant ${next.name}`);
+    // The game turned it down — most likely its "stop what you're doing?" prompt is waiting on
+    // you. Answer it and press Start again; we don't retry, or we'd stack modals on you.
+    endJob(`stopped: the game wouldn't start a disenchant on ${next.name}`);
     return;
   }
   job.done += 1;
@@ -877,10 +872,6 @@ function driveQueue(ench) {
 }
 
 function driveEnchantTask(ench, task) {
-  if (!skillSlotFree(ench)) {
-    endJob("paused: another skill or combat is using the action slot");
-    return;
-  }
   if (ench.isActive) return; // an enchant is running; the action hook takes it from here
 
   const item = job.item;
@@ -910,7 +901,7 @@ function driveEnchantTask(ench, task) {
   }
 
   if (!startSkillAction(ench, ENCHANT, item)) {
-    finishTask(task, "failed", "could not start the enchant");
+    finishTask(task, "failed", "the game wouldn't start the enchant");
     return;
   }
   setStatus(`enchanting ${item.name} → ${qualityName(qualityOf(item) + 1)}`);
@@ -1312,7 +1303,7 @@ function buildSweepSection() {
     el(
       "div",
       `${MARK}-note`,
-      "Locked items are always skipped. The skill mode stops if combat or another skill needs the action slot.",
+      "Locked items are always skipped. Skill mode uses the Enchanting action slot, so it stops whatever else you were doing — same as clicking Disenchant yourself.",
     ),
   );
   return wrap;
