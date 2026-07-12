@@ -481,11 +481,11 @@ function patchAction(proto) {
     try {
       const task = runningTask();
       if (task?.kind === "enchant") {
-        // Hand the task its new item here and now, not in the deferred callback below.
-        // createEnchantingItem() ran inside the action we just let finish, so lastCreated can
-        // only be the item that action made — and doing it synchronously means a Stop landing
-        // in between still leaves the task pointing at an item that actually exists.
-        job.followed = adoptProduced(this, task, lastCreated);
+        // Hand the task its new item here and now, not in the deferred callback below. The
+        // action has already banked what it made, so the bank can be counted — and doing it
+        // synchronously means a Stop landing in between still leaves the task pointing at an
+        // item that actually exists.
+        job.followed = adoptProduced(this, task);
         // Defer the decision by a macrotask so the mod's own handler is completely done.
         setTimeout(() => onEnchantActionDone(), 0);
       }
@@ -498,25 +498,63 @@ function patchAction(proto) {
   proto.action = patched;
 }
 
-// Only follow the new item if it really is the old one, one grade up.
-function adoptProduced(ench, task, produced) {
+// Work out which item the enchant we just let finish actually produced.
+//
+// Asking the mod ("what did createEnchantingItem last return?") is one signal, but a fragile
+// one: it depends on our patch landing on the right object, and on nothing else creating an
+// item in between. So the answer comes from the bank instead. An enchant banks exactly one of
+// the item it made, so we snapshot the possible successors before starting and look for the
+// stack that grew.
+//
+// This is what makes duplicates work. The mod reuses an identical roll rather than making a
+// second copy of it, so the "new" item is very often one you already owned — the stack just
+// goes from 3 to 4. And several of your items can share a base, a grade and a name while being
+// different objects. Counting is the only thing that tells them apart.
+function adoptProduced(ench, task) {
   const previous = job.item;
-  const followsOn =
-    produced &&
-    ench.isAugmentedItem(produced) &&
-    produced.item === (previous?.item ?? previous) &&
-    qualityOf(produced) === qualityOf(previous) + 1;
+  if (!previous) return false;
 
-  if (!followsOn) return false;
+  const bank = getBank();
+  const before = job.before ?? new Map();
+  const grown = successors(ench, previous).filter(
+    (candidate) => bank.getQty(candidate) > (before.get(candidate.id) ?? 0),
+  );
+
+  // Exactly one stack should have grown. If something else banked a matching item while the
+  // enchant was running (a drop, say), fall back to what the mod told us it created.
+  const produced =
+    grown.length === 1 ? grown[0] : (grown.find((candidate) => candidate === lastCreated) ?? grown[0]);
+
+  if (!produced) {
+    warn(
+      `could not tell which item the enchant produced from ${previous.name} ` +
+        `(grade ${qualityOf(previous)} -> ${qualityOf(previous) + 1}). Is the bank full?`,
+      { previous, lastCreated, candidates: successors(ench, previous) },
+    );
+    return false;
+  }
 
   adoptItem(task, produced);
   saveSettings(); // once per 10-second enchant; cheap, and it makes a Stop safe
   return true;
 }
 
+// Whichever object actually owns `name` — the prototype for a normal class method, the instance
+// itself if it was written as a class field. Patching the prototype blindly is how a patch ends
+// up silently doing nothing.
+function ownerOf(object, name) {
+  let owner = object;
+  while (owner && !Object.prototype.hasOwnProperty.call(owner, name)) owner = Object.getPrototypeOf(owner);
+  return owner;
+}
+
 function installPatches(ench) {
   const proto = Object.getPrototypeOf(ench);
   if (!proto) return;
+
+  for (const name of ["replaceRewards", "replaceDrop", "createEnchantingItem", "action"]) {
+    if (!ownerOf(ench, name)) warn(`the Enchanting skill has no ${name}() — that part of the mod will not work`);
+  }
 
   patchReplace(proto, "replaceRewards", function (original, item, quantity) {
     if (!settings.enabled) return original.call(this, item, quantity);
@@ -536,8 +574,10 @@ function installPatches(ench) {
     return { item: rolled, quantity: qty };
   });
 
-  patchItemCreation(proto);
-  patchAction(proto);
+  // lastCreated is only a tie-breaker now — adoptProduced() counts the bank — but patch the
+  // object that really owns the method, not whatever the prototype happens to have.
+  patchItemCreation(ownerOf(ench, "createEnchantingItem") ?? proto);
+  patchAction(ownerOf(ench, "action") ?? proto);
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +846,26 @@ function startQueue() {
   beginJob({ type: "queue", taskID: null, item: null, targets: null, produced: null, rerolls: 0 }, "working through the queue");
 }
 
+// The items in the bank an enchant of `item` could have produced: same base item, one grade up.
+// Several of them can exist at once — same base, same grade, different rolled modifiers — and
+// they all share a display name, which is why identifying the new one by name or by grade alone
+// does not work.
+function successors(ench, item) {
+  const base = ench.isAugmentedItem(item) ? item.item : item;
+  const quality = qualityOf(item) + 1;
+  return bankItems(
+    (candidate) =>
+      ench.isAugmentedItem(candidate) && candidate.item === base && qualityOf(candidate) === quality,
+  );
+}
+
+function snapshotSuccessors(ench, item) {
+  const bank = getBank();
+  const counts = new Map();
+  for (const candidate of successors(ench, item)) counts.set(candidate.id, bank.getQty(candidate));
+  return counts;
+}
+
 // Point a running task at the item it now owns.
 //
 // An enchant or a reroll REPLACES the item with a new object carrying a new (random) id. The
@@ -900,6 +960,9 @@ function driveEnchantTask(ench, task) {
     return;
   }
 
+  // Count the stacks this enchant could land in, before it lands in one of them.
+  job.before = snapshotSuccessors(ench, item);
+
   if (!startSkillAction(ench, ENCHANT, item)) {
     finishTask(task, "failed", "the game wouldn't start the enchant");
     return;
@@ -924,7 +987,7 @@ function onEnchantActionDone() {
   }
 
   if (!job.followed) {
-    finishTask(task, "failed", "lost track of the item after the enchant");
+    finishTask(task, "failed", "the enchant produced nothing — is the bank full?");
   }
   driveJob();
 }

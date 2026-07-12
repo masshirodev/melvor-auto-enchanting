@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Packages the mod into auto-enchanting.zip for upload to mod.io / the Mod Manager.
+# Packages the mod into auto-enchanting-v<version>.zip for upload to mod.io / the Mod Manager.
 #
 # manifest.json and setup.mjs must sit at the ROOT of the archive, not inside a mod/
 # folder. Melvor can install a wrongly nested mod without running it, so `zip -j` is
@@ -9,7 +9,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OUT="auto-enchanting.zip"
 FILES=(mod/manifest.json mod/setup.mjs)
 
 for f in "${FILES[@]}"; do
@@ -24,6 +23,7 @@ if [[ "${1:-}" != "--skip-tests" ]]; then
 fi
 
 VERSION=$(node -pe 'require("./mod/manifest.json").version')
+OUT="auto-enchanting-v$VERSION.zip"
 
 rm -f "$OUT"
 zip -j -q "$OUT" "${FILES[@]}"

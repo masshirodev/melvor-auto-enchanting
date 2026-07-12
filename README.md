@@ -65,7 +65,7 @@ modifier on a three-slot item and the task is done the moment that one appears.
 
 ## Install
 
-**From a modfile:** install `auto-enchanting.zip` (contains `manifest.json` + `setup.mjs` at the
+**From a modfile:** install `auto-enchanting-v<version>.zip` (contains `manifest.json` + `setup.mjs` at the
 archive root).
 
 **As a local mod:** create a local mod in the Melvor Mod Manager and point it at the `mod/`
@@ -119,7 +119,7 @@ Things worth knowing before changing this:
 ## Build
 
 ```sh
-./build.sh              # syntax-check, run tests, package auto-enchanting.zip
+./build.sh              # syntax-check, run tests, package auto-enchanting-v<version>.zip
 ./build.sh --skip-tests
 ```
 

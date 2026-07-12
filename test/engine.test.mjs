@@ -378,6 +378,11 @@ class FakeEnchanting {
         : this.createEnchantingItem(this.selectedItem, 1);
       bank.addItem(made, 1);
       this.xp += ENCHANT_ACTION.baseXP;
+
+      // The real mod keeps building things after it hands you the item — its bank upgrade
+      // chain — so "the last item createEnchantingItem returned" is NOT a reliable pointer to
+      // what the enchant produced. Reproduce that here: anything relying on it must break.
+      this.createEnchantingItem(helmet, 1);
     } else if (this.currentAction === DISENCHANT_ACTION) {
       const quality = this.selectedItem.item !== undefined ? this.selectedItem.quality : 0;
       const [essence, qty] = this.getEssenceForItem(this.selectedItem, quality);
@@ -659,10 +664,42 @@ check("one item is walked all the way up to the target grade", bank.getQty(epic)
 check("the rest of the stack is left alone", bank.getQty(platebody) === 2, `plain=${bank.getQty(platebody)}`);
 check(
   "nothing is left stranded at the grades in between",
-  bank.getQty(enchanting.equipment.allObjects.find((i) => i.quality === 1)) === 0,
+  bank.getQty(enchanting.equipment.allObjects.find((i) => i.quality === 1 && i.item === platebody)) === 0,
 );
 check("the task is marked done", api.settings.queue[0].status === "done", api.settings.queue[0].status);
 check("the queue stops once it's empty of work", api.job === null && !enchanting.isActive);
+
+// Duplicates. The mod reuses an identical roll rather than making a second copy of it, so the
+// item an enchant "creates" is very often one you already own — the stack just goes from 2 to 3.
+// Several of your items can also share a base, a grade and a name while being different objects.
+// Counting which stack grew is the only thing that tells them apart.
+clearButton.fire("click");
+bank.items.clear();
+enchanting.equipment.allObjects.length = 0;
+
+const twin = enchanting.createEnchantingItem(platebody, 1, new Set([MODS[0]]));
+bank.items.set(twin, 2); // you already own two of exactly what the enchant is about to make
+bank.items.set(platebody, 1);
+for (const essence of ESSENCE) bank.items.set(essence, 500);
+
+enchantItemSelect.value = platebody.id;
+enchantGradeSelect.value = "2"; // Rare
+addEnchantButton.fire("click");
+const dupTask = api.settings.queue[0];
+
+rollScript = [0]; // the plain item rolls Alpha, i.e. exactly the twin you already have
+startQueueButton.fire("click");
+await step();
+await runAction();
+
+check(
+  "an enchant that lands in a stack you already own is still found",
+  dupTask.itemID === twin.id && bank.getQty(twin) === 3,
+  `itemID=${dupTask.itemID} twins=${bank.getQty(twin)}`,
+);
+
+for (let i = 0; i < 5 && api.job; i += 1) await runAction();
+check("and the task runs to its target from there", dupTask.status === "done", `${dupTask.status} — ${dupTask.note}`);
 
 // Stopping and restarting mid-task must resume, not fail.
 //

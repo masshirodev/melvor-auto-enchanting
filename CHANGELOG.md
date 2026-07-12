@@ -20,6 +20,16 @@
   item it actually holds, so Stop/Start resumes where it left off. The adoption happens
   synchronously inside the action hook, so even a Stop landing between an enchant completing and
   our callback running leaves the task pointing at an item that exists.
+- **Fixed: enchant tasks failing with "lost track of the item after the enchant".** Finding the
+  item an enchant produced relied on a single fragile signal — whatever `createEnchantingItem()`
+  last returned — which is wrong the moment the mod creates anything else afterwards (it builds a
+  bank upgrade chain right after handing you the item), and null if that patch never lands. Then
+  *every* task fails. The new item is now identified by counting the bank instead: snapshot the
+  stacks an enchant could land in, and see which one grew. That also fixes the duplicate case for
+  good — the mod reuses an identical roll rather than making a second copy of it, so the "new"
+  item is very often one you already owned and the stack simply goes from 2 to 3, and several of
+  your items can share a base, a grade and a name while being different objects. Counting is the
+  only thing that tells them apart.
 - **Fixed: the bank sweep refused to start while you were doing anything else.** It checked
   `game.activeAction` itself and gave up — so with combat running, "990 stacks match" turned into
   "stopped: another skill or combat is using the action slot" and nothing happened. Whether an
