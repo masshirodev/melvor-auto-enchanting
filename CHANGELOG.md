@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.2 - A task queue, and a panel that reads like one
+## 0.2.0 - A task queue, an icon grid, and no more ten-second waits
 
 - **Enchant tasks fast-forward by default.** Instead of driving the mod's ten-second Enchant
   action and then working out what it did, the item is walked up the grades directly: make the

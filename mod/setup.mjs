@@ -34,7 +34,7 @@
 // An enchant or a reroll replaces the item with a brand-new object, so a queued task follows
 // the item it made rather than the id you picked. See onEnchantActionDone() and rerollSlot().
 
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 const TAG = `[Auto Enchanting v${VERSION}]`;
 const MARK = "auto-enchanting";
 const PATCH_FLAG = `__${MARK}_patched`;
