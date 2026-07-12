@@ -35,8 +35,11 @@ top to bottom, marking each task done or failed with the reason. A task that fai
 locked, the essence ran out, you asked for three modifiers on a two-slot item — doesn't stop the
 rest of the queue. **Clear finished** tidies up.
 
-Item dropdowns list everything eligible in the bank, alphabetically, with live quantities: they
-refresh as you enchant and disenchant.
+**Picking items.** Each picker opens a searchable, paged grid of item icons, coloured by grade.
+Hovering one tells you its grade, how many you have, the modifiers and specials it rolled, what
+it would disenchant into, and whether it's locked. A dropdown was the wrong tool here: several of
+your items share a name, so a list reading "Uncommon Fury of the Elemental Zodiacs" three times
+over told you nothing about which was which.
 
 Auto Enchanting takes over the Enchanting mod's six native auto-disenchant fields while the
 master switch is enabled, remembers their old values, forces the native feature off, and hides

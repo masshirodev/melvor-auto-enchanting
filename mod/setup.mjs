@@ -1136,6 +1136,75 @@ function injectStyles() {
     .${MARK}-running { font-weight: 600; }
     .${MARK}-done { color: #46c37b; }
     .${MARK}-failed { color: #d26a5c; }
+
+    /* The item you have picked, standing in for a dropdown. */
+    .${MARK}-pick { display: inline-flex; align-items: center; gap: .4rem; min-width: 16rem; justify-content: flex-start; }
+    .${MARK}-pick-img { width: 24px; height: 24px; object-fit: contain; }
+    .${MARK}-pick-img[hidden] { display: none; }
+
+    .${MARK}-task-item { white-space: nowrap; }
+    .${MARK}-task-img { width: 20px; height: 20px; object-fit: contain; margin-right: .35rem; vertical-align: middle; }
+
+    /* The picker overlay. */
+    .${MARK}-overlay {
+      position: fixed; inset: 0; z-index: 100000;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0, 0, 0, .6);
+    }
+    .${MARK}-overlay[hidden] { display: none; }
+    .${MARK}-picker {
+      display: flex; flex-direction: column;
+      width: min(900px, 92vw); max-height: 82vh;
+      padding: 16px; border-radius: 8px;
+      background: var(--bs-body-bg, #2d2f36);
+      color: var(--bs-body-color, #cfd2da);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, .5);
+    }
+    .${MARK}-picker-bar { display: flex; align-items: center; gap: .5rem; margin-bottom: .75rem; }
+    .${MARK}-picker-bar .block-title { margin: 0; flex: 0 0 auto; }
+    .${MARK}-search { flex: 1 1 auto; }
+
+    .${MARK}-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
+      grid-auto-rows: 60px; /* a definite row height, so icons never overlap */
+      gap: 6px;
+      flex: 1 1 auto; min-height: 0; /* let it scroll rather than blow the panel open */
+      overflow-y: auto; padding: 4px;
+    }
+    .${MARK}-cell {
+      position: relative;
+      display: flex; align-items: center; justify-content: center;
+      padding: 4px; overflow: hidden;
+      border: 1px solid transparent; border-radius: 6px;
+      background: rgba(255, 255, 255, .04);
+      cursor: pointer;
+      transition: transform .06s ease, border-color .06s ease;
+    }
+    .${MARK}-cell img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+    .${MARK}-cell:hover { border-color: var(--bs-primary, #4c84ff); transform: scale(1.08); background: rgba(255,255,255,.1); }
+    .${MARK}-cell-qty {
+      position: absolute; right: 2px; bottom: 1px;
+      font-size: 10px; font-weight: 600; line-height: 1;
+      padding: 1px 3px; border-radius: 3px;
+      background: rgba(0, 0, 0, .65); color: #fff;
+      pointer-events: none;
+    }
+
+    .${MARK}-pager { display: flex; align-items: center; justify-content: center; gap: .75rem; padding-top: .5rem; }
+    .${MARK}-hint { font-size: .8rem; opacity: .7; }
+
+    .${MARK}-tip {
+      position: fixed; z-index: 100001; pointer-events: none;
+      max-width: 22rem; padding: 6px 10px; border-radius: 4px;
+      background: rgba(15, 16, 20, .96); color: #fff;
+      font-size: 12px; line-height: 1.35;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .5);
+    }
+    .${MARK}-tip[hidden] { display: none; }
+    .${MARK}-tip-head { margin-top: .35rem; font-weight: 600; opacity: .75; }
+    .${MARK}-tip-sub { opacity: .7; }
+    .${MARK}-tip-locked { margin-top: .35rem; color: #f0ad4e; }
   `;
   document.head.append(style);
 }
@@ -1245,41 +1314,249 @@ function button(label, className, onClick) {
   return node;
 }
 
-// An item dropdown, rebuilt only when the set of items in it actually changes — so it can be
-// refreshed on a timer without snatching the list out from under a click. Alphabetical.
-function itemSelect() {
-  const node = el("select", "form-control form-control-sm");
-  node.__options = null;
+// ---------------------------------------------------------------------------
+// Item picker
+//
+// A grid of icons in an overlay, the same shape as requirement-filler's item adder: search,
+// page, click to pick. Icons beat a dropdown here because an item's grade is the thing you are
+// choosing by, and several of your items share a name — "Uncommon Fury of the Elemental
+// Zodiacs" three times over tells you nothing, while three icons and a tooltip do.
+//
+// The grade colouring is free: an enchanted item's .media already ends in "#q=<grade>", and the
+// Enchanting mod's own stylesheet paints any img whose src carries that.
+// ---------------------------------------------------------------------------
+
+const PAGE_SIZE = 300;
+
+// The item each picker currently holds. Not persisted — it's what the next Add will use, not a
+// setting. Keyed by id as well, so we can tell when the bank has moved on from it.
+const picked = { enchant: null, reroll: null };
+
+let picker = null; // the overlay, built once on first open
+
+function itemMedia(item) {
+  return item?.media ?? "";
+}
+
+// Everything the panel knows about an item, for the hover tooltip: what it is, what it rolled,
+// and what it would turn back into.
+function itemTooltip(ench, item) {
+  const bank = getBank();
+  const quality = qualityOf(item);
+  const lines = [];
+
+  lines.push(`<div class="font-w600 text-enchanting-quality-${quality}">${item.name}</div>`);
+  lines.push(`<div class="${MARK}-tip-sub">${qualityName(quality)} · ${bank?.getQty?.(item) ?? 0} in bank</div>`);
+
+  const mods = [...(item.extraModifiers ?? [])];
+  if (mods.length) {
+    lines.push(`<div class="${MARK}-tip-head">Modifiers</div>`);
+    for (const mod of mods) lines.push(`<div>${modName(mod)}</div>`);
+  }
+
+  const specials = [...(item.extraSpecials ?? [])];
+  if (specials.length) {
+    lines.push(`<div class="${MARK}-tip-head">Specials</div>`);
+    for (const special of specials) lines.push(`<div>${special.name ?? special.localID ?? special.id}</div>`);
+  }
+
+  try {
+    const [essence, amount] = ench.getEssenceForItem(item, quality);
+    if (essence) lines.push(`<div class="${MARK}-tip-sub">Disenchants into ${amount}x ${essence.name}</div>`);
+  } catch {
+    // A tooltip is never worth an exception.
+  }
+
+  if (isLocked(item)) lines.push(`<div class="${MARK}-tip-locked">Locked — bulk jobs skip it</div>`);
+
+  return lines.join("");
+}
+
+function buildPicker() {
+  const overlay = el("div", `${MARK}-overlay`);
+  overlay.hidden = true;
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) closePicker();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && picker && !picker.overlay.hidden) closePicker();
+  });
+
+  const panel = el("div", `${MARK}-picker`);
+  overlay.append(panel);
+
+  const bar = el("div", `${MARK}-picker-bar`);
+  const title = el("h3", "block-title", "Pick an item");
+
+  const search = el("input", `form-control form-control-sm ${MARK}-search`);
+  search.type = "search";
+  search.placeholder = "Search…";
+  search.addEventListener("input", () => {
+    picker.page = 0;
+    renderPicker();
+  });
+
+  const close = button("Close", "btn-secondary", closePicker);
+  bar.append(title, search, close);
+
+  const grid = el("div", `${MARK}-grid`);
+
+  const hint = el("div", `${MARK}-hint`);
+  const pager = el("div", `${MARK}-pager`);
+  const prev = button("‹ Prev", "btn-secondary", () => {
+    picker.page = Math.max(0, picker.page - 1);
+    renderPicker();
+  });
+  const next = button("Next ›", "btn-secondary", () => {
+    picker.page += 1;
+    renderPicker();
+  });
+  pager.append(prev, hint, next);
+
+  const tip = el("div", `${MARK}-tip`);
+  tip.hidden = true;
+
+  // Delegated, so a re-render never leaves a stale listener behind.
+  grid.addEventListener("mouseover", (event) => {
+    const cell = event.target?.closest?.(`.${MARK}-cell`);
+    const item = cell?.__item;
+    if (!item) return;
+    tip.innerHTML = itemTooltip(getEnchanting(), item);
+    tip.hidden = false;
+    positionTip(tip, event.clientX, event.clientY);
+  });
+  grid.addEventListener("mousemove", (event) => {
+    if (!tip.hidden) positionTip(tip, event.clientX, event.clientY);
+  });
+  grid.addEventListener("mouseout", (event) => {
+    if (!event.relatedTarget?.closest?.(`.${MARK}-cell`)) tip.hidden = true;
+  });
+  grid.addEventListener("click", (event) => {
+    const item = event.target?.closest?.(`.${MARK}-cell`)?.__item;
+    if (!item) return;
+    tip.hidden = true;
+    picker.onPick?.(item);
+    closePicker();
+  });
+
+  panel.append(bar, grid, pager);
+  overlay.append(tip);
+  document.body.append(overlay);
+
+  picker = { overlay, title, search, grid, hint, prev, next, tip, items: [], page: 0, onPick: null };
+  return picker;
+}
+
+function positionTip(tip, x, y) {
+  const offset = 14;
+  const width = tip.offsetWidth ?? 0;
+  let left = x + offset;
+  if (left + width > (globalThis.innerWidth ?? 1920) - 8) left = x - width - offset;
+  tip.style.left = `${Math.max(8, left)}px`;
+  tip.style.top = `${y + offset}px`;
+}
+
+function pickerMatches() {
+  const needle = String(picker.search.value ?? "").trim().toLowerCase();
+  if (!needle) return picker.items;
+  return picker.items.filter((item) => item.name.toLowerCase().includes(needle));
+}
+
+function renderPicker() {
+  const ench = getEnchanting();
+  const bank = getBank();
+  const matches = pickerMatches();
+
+  const pages = Math.max(1, Math.ceil(matches.length / PAGE_SIZE));
+  picker.page = Math.min(picker.page, pages - 1);
+  const shown = matches.slice(picker.page * PAGE_SIZE, picker.page * PAGE_SIZE + PAGE_SIZE);
+
+  const cells = shown.map((item) => {
+    const cell = el("button", `${MARK}-cell`);
+    cell.type = "button";
+    cell.setAttribute("aria-label", item.name);
+    cell.__item = item;
+
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = itemMedia(item); // carries #q=<grade>, which the Enchanting mod's CSS colours
+    img.alt = item.name;
+    cell.append(img);
+
+    const qty = el("span", `${MARK}-cell-qty`, String(bank?.getQty?.(item) ?? 0));
+    cell.append(qty);
+
+    if (ench?.isAugmentedItem?.(item)) cell.classList.add(`${MARK}-q${qualityOf(item)}`);
+    return cell;
+  });
+
+  picker.grid.replaceChildren(...cells);
+  picker.hint.textContent = matches.length
+    ? `${matches.length} item${matches.length === 1 ? "" : "s"} · page ${picker.page + 1} of ${pages}`
+    : "nothing eligible";
+  picker.prev.disabled = picker.page === 0;
+  picker.next.disabled = picker.page >= pages - 1;
+}
+
+function openPicker(title, items, onPick) {
+  if (!picker) buildPicker();
+  picker.items = items;
+  picker.onPick = onPick;
+  picker.page = 0;
+  picker.title.textContent = title;
+  picker.search.value = "";
+  picker.overlay.hidden = false;
+  renderPicker();
+  picker.search.focus?.();
+}
+
+function closePicker() {
+  if (!picker) return;
+  picker.overlay.hidden = true;
+  picker.tip.hidden = true;
+}
+
+// The button that stands in for a dropdown: shows what you picked, opens the grid when clicked.
+function pickerButton(slot, title, itemsFor) {
+  const node = el("button", `btn btn-sm btn-outline-info ${MARK}-pick`);
+  node.type = "button";
+
+  const img = document.createElement("img");
+  img.className = `${MARK}-pick-img`;
+  const label = el("span", null, "Pick an item");
+  node.append(img, label);
+
+  node.addEventListener("click", () => {
+    const ench = getEnchanting();
+    if (!ench) return;
+    openPicker(title, itemsFor(ench), (item) => {
+      picked[slot] = item;
+      if (slot === "reroll") refreshModList(true);
+      updatePanel();
+    });
+  });
+
+  node.__img = img;
+  node.__label = label;
   return node;
 }
 
-function refreshItemSelect(node, items) {
+// The pick is an item object; the bank can move on from it (you enchanted it, you sold it), so
+// re-resolve it by id every refresh and drop it if it's gone.
+function refreshPick(ench, slot, node, items) {
   if (!node) return;
-  const bank = getBank();
+  const current = picked[slot];
+  if (current) picked[slot] = findInBank(items, current.id) ?? null;
 
-  // Keyed on quantity as well as identity: enchanting or disenchanting something changes how
-  // many you have of it without changing the list, and a count that doesn't move is exactly
-  // the "this list is stale" bug. Rebuilding only on a real change still keeps the dropdown
-  // from being yanked out from under a click.
-  const key = items.map((item) => `${item.id}:${bank?.getQty?.(item) ?? 0}`).join(",");
-  if (node.__options === key) return;
-  node.__options = key;
-
-  const previous = node.value;
-  node.replaceChildren();
-
-  const none = document.createElement("option");
-  none.value = "";
-  none.textContent = items.length ? "— pick an item —" : "— nothing eligible —";
-  node.append(none);
-
-  for (const item of items) {
-    const option = document.createElement("option");
-    option.value = item.id;
-    option.textContent = `${item.name} (${bank?.getQty?.(item) ?? 0})`;
-    node.append(option);
-  }
-  node.value = items.some((item) => item.id === previous) ? previous : "";
+  const item = picked[slot];
+  node.__img.src = item ? itemMedia(item) : "";
+  node.__img.hidden = !item;
+  node.__label.textContent = item
+    ? `${item.name} (${getBank()?.getQty?.(item) ?? 0})`
+    : items.length
+      ? "Pick an item"
+      : "Nothing eligible";
+  node.disabled = !items.length;
 }
 
 // --- Sections --------------------------------------------------------------
@@ -1376,7 +1653,7 @@ function buildQueueSection() {
   const wrap = section("Task queue");
 
   // Add an enchant task.
-  const enchantItem = itemSelect();
+  const enchantItem = pickerButton("enchant", "Pick an item to enchant", (ench) => enchantable(ench));
   parts.enchantItem = enchantItem;
 
   // Not persisted: it's what the next Add will use, not a setting.
@@ -1391,8 +1668,7 @@ function buildQueueSection() {
   );
 
   // Add a reroll task.
-  const rerollItem = itemSelect();
-  rerollItem.addEventListener("change", () => refreshModList(true));
+  const rerollItem = pickerButton("reroll", "Pick an item to reroll", (ench) => rerollable(ench));
   parts.rerollItem = rerollItem;
 
   const mods = el("select", `form-control form-control-sm ${MARK}-mods`);
@@ -1441,7 +1717,7 @@ function onAddEnchant() {
   const ench = getEnchanting();
   if (!ench) return;
 
-  const item = findInBank(enchantable(ench), parts.enchantItem.value);
+  const item = picked.enchant && findInBank(enchantable(ench), picked.enchant.id);
   if (!item) {
     setStatus("pick an item to enchant first");
     return;
@@ -1460,7 +1736,7 @@ function onAddReroll() {
   const ench = getEnchanting();
   if (!ench) return;
 
-  const item = findInBank(rerollable(ench), parts.rerollItem.value);
+  const item = picked.reroll && findInBank(rerollable(ench), picked.reroll.id);
   if (!item) {
     setStatus("pick an item to reroll first");
     return;
@@ -1492,7 +1768,7 @@ function refreshModList(force) {
   const node = parts.rerollMods;
   if (!ench || !node) return;
 
-  const item = findInBank(rerollable(ench), parts.rerollItem.value);
+  const item = picked.reroll;
   const pool = item ? [...ench.getPossibleMods(item.item, item.quality)] : [];
   pool.sort((a, b) => modName(a).localeCompare(modName(b)));
 
@@ -1520,7 +1796,10 @@ function refreshQueueTable() {
 
   // Rebuild only when something actually changed, so clicking Remove isn't a race with the
   // 1-second refresh.
-  const key = settings.queue.map((task) => `${task.id}:${task.status}:${task.note}`).join("|");
+  // The item a task holds changes as it climbs the grades, so it belongs in the key too.
+  const key = settings.queue
+    .map((task) => `${task.id}:${task.status}:${task.note}:${task.itemID}:${task.itemName}`)
+    .join("|");
   if (parts.queueKey === key) return;
   parts.queueKey = key;
 
@@ -1535,11 +1814,27 @@ function refreshQueueTable() {
     return;
   }
 
+  const ench = getEnchanting();
+
   for (const task of settings.queue) {
     const row = document.createElement("tr");
+
+    // The task tracks the item it holds *now*, so show that: an enchant task renames itself as
+    // it climbs the grades, and the icon recolours with it.
+    const live = ench && findInBank(bankItems(() => true), task.itemID);
+    const itemCell = el("td", `${MARK}-task-item`);
+    if (live) {
+      const img = document.createElement("img");
+      img.className = `${MARK}-task-img`;
+      img.src = itemMedia(live);
+      img.alt = "";
+      itemCell.append(img);
+    }
+    itemCell.append(el("span", `text-enchanting-quality-${qualityOf(live)}`, task.itemName));
+
     row.append(
       el("td", null, task.kind === "enchant" ? "Enchant" : "Reroll"),
-      el("td", null, task.itemName),
+      itemCell,
       el("td", null, goalText(task)),
       el("td", `${MARK}-${task.status}`, task.note ? `${task.status} — ${task.note}` : task.status),
     );
@@ -1583,8 +1878,8 @@ function updatePanel() {
         : `${matching} stack${matching === 1 ? "" : "s"} match`;
   }
 
-  refreshItemSelect(parts.enchantItem, enchantable(ench));
-  refreshItemSelect(parts.rerollItem, rerollable(ench));
+  refreshPick(ench, "enchant", parts.enchantItem, enchantable(ench));
+  refreshPick(ench, "reroll", parts.rerollItem, rerollable(ench));
   refreshModList(false);
   refreshQueueTable();
 

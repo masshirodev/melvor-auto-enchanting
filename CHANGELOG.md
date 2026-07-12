@@ -2,6 +2,16 @@
 
 ## 0.1.2 - A task queue, and a panel that reads like one
 
+- **Items are picked from an icon grid, not a dropdown.** Clicking a picker opens a searchable,
+  paged grid of icons — the same shape as requirement-filler's item adder. Grades colour
+  themselves for free: an enchanted item's `media` already ends in `#q=<grade>`, which the
+  Enchanting mod's own stylesheet paints. This matters because a dropdown was actively bad here:
+  several of your items share a name, so "Uncommon Fury of the Elemental Zodiacs" three times
+  over told you nothing about which was which.
+- **Hovering an item shows what it is.** Grade, quantity, rolled modifiers, specials, what it
+  would disenchant into, and whether it's locked.
+- Queue rows show the item's icon, grade-coloured, and follow it as it climbs.
+
 - **Enchant and reroll are now queued.** Pick an item, set the goal, press **Add**; the task
   joins a list. **Start queue** works through it top to bottom, marking each task done or failed
   with the reason. A task that fails doesn't take the rest of the queue down with it, and

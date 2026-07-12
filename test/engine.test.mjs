@@ -17,35 +17,51 @@ const check = (name, pass, extra = "") => {
 
 // ---- fake DOM -------------------------------------------------------------
 
-const mkClassList = () => {
-  const set = new Set();
-  return {
-    add: (c) => set.add(c),
-    remove: (c) => set.delete(c),
-    contains: (c) => set.has(c),
-    toggle: (c, on) => (on ? set.add(c) : set.delete(c)),
+// className and classList are the same set of classes, as they are in a real DOM. Keeping them
+// apart meant a node built with el("div", "…-grid") had an empty classList, and nothing that
+// looks classes up — closest(), the tests — could find it.
+const mkEl = (tag = "div") => {
+  const classes = new Set();
+  const setClasses = (value) => {
+    classes.clear();
+    for (const name of String(value ?? "").split(/\s+/)) if (name) classes.add(name);
   };
-};
 
-const mkEl = (tag = "div") => ({
+  return {
   tag,
   children: [],
   listeners: {},
-  classList: mkClassList(),
+  classList: {
+    add: (c) => classes.add(c),
+    remove: (c) => classes.delete(c),
+    contains: (c) => classes.has(c),
+    toggle: (c, on) => (on ? classes.add(c) : classes.delete(c)),
+  },
+  get className() {
+    return [...classes].join(" ");
+  },
+  set className(value) {
+    setClasses(value);
+  },
   style: {},
   textContent: "",
+  innerHTML: "",
   value: "",
   checked: false,
   disabled: false,
+  hidden: false,
   multiple: false,
   selectedOptions: [],
   append(...kids) {
+    for (const kid of kids) if (kid) kid.parent = this;
     this.children.push(...kids);
   },
   prepend(...kids) {
+    for (const kid of kids) if (kid) kid.parent = this;
     this.children.unshift(...kids);
   },
   replaceChildren(...kids) {
+    for (const kid of kids) if (kid) kid.parent = this;
     this.children = kids;
   },
   after(node) {
@@ -54,12 +70,25 @@ const mkEl = (tag = "div") => ({
   addEventListener(type, fn) {
     (this.listeners[type] ??= []).push(fn);
   },
-  fire(type) {
-    for (const fn of this.listeners[type] ?? []) fn();
+  // Events don't bubble in this fake, so a delegated listener is fired directly on the node
+  // that owns it, with the real target handed in — which is what closest() then walks up from.
+  fire(type, event = {}) {
+    for (const fn of this.listeners[type] ?? []) fn({ target: this, ...event });
+  },
+  closest(selector) {
+    const want = selector.replace(".", "");
+    let node = this;
+    while (node) {
+      if (node.classList?.contains(want)) return node;
+      node = node.parent;
+    }
+    return null;
   },
   querySelector: (sel) => (sel === ".skill-info" ? skillInfo : null),
+  focus() {},
   setAttribute() {},
-});
+  };
+};
 
 const container = mkEl("div");
 const skillInfo = mkEl("div");
@@ -70,6 +99,7 @@ globalThis.document = {
   createElement: (tag) => mkEl(tag),
   createTextNode: (text) => ({ tag: "#text", textContent: text, children: [] }),
   getElementById: (id) => (id === "enchanting-container" ? container : null),
+  addEventListener() {}, // the picker listens for Escape
 };
 
 const walk = (node, out = []) => {
@@ -445,17 +475,29 @@ const addRerollButton = queueButtons.filter((b) => b.textContent === "Add")[1];
 const startQueueButton = queueButtons.find((b) => b.textContent === "Start queue");
 const clearButton = queueButtons.find((b) => b.textContent === "Clear finished");
 
-const enchantItemSelect = controlIn(queueSection, "Enchant");
+const enchantPickButton = controlIn(queueSection, "Enchant");
 const enchantGradeSelect = controlIn(queueSection, "Up to");
-const rerollItemSelect = controlIn(queueSection, "Reroll");
+const rerollPickButton = controlIn(queueSection, "Reroll");
 const rerollModsSelect = controlIn(queueSection, "Until it has");
+
+// Picking an item the way you would: click the button, find the icon in the grid, click it.
+// The overlay is built lazily on first open and appended to document.body.
+const pickItem = (pickButton, item) => {
+  pickButton.fire("click");
+  const overlay = document.body.children.at(-1);
+  const grid = walk(overlay).find((node) => node.classList.contains("auto-enchanting-grid"));
+  const cell = grid.children.find((node) => node.__item === item);
+  if (!cell) throw new Error(`no cell in the picker grid for ${item.name} (${item.id})`);
+  grid.fire("click", { target: cell });
+  return { overlay, grid, cell };
+};
 
 check("the panel mounts under the skill header", container.children.length === 1);
 check("every section is built", !!lootSection && !!sweepSection && !!queueSection);
 check(
   "every control is reachable",
   !!sweepButton && !!addEnchantButton && !!addRerollButton && !!startQueueButton && !!clearButton &&
-    !!enchantItemSelect && !!enchantGradeSelect && !!rerollItemSelect && !!rerollModsSelect,
+    !!enchantPickButton && !!enchantGradeSelect && !!rerollPickButton && !!rerollModsSelect,
 );
 
 // ===========================================================================
@@ -648,7 +690,27 @@ for (const essence of ESSENCE) bank.items.set(essence, 500);
 api.settings.essenceFloor = 0;
 api.save();
 
-enchantItemSelect.value = platebody.id;
+// Picking goes through the icon grid, and the grid is where the item's details live: several
+// of your items share a name, so the icon (grade-coloured) and its tooltip are what tell them
+// apart.
+bank.items.set(enchanting.createEnchantingItem(platebody, 2, new Set([MODS[0], MODS[1]])), 1);
+const picker = pickItem(enchantPickButton, platebody);
+
+check("the picker is a grid of icons, one per eligible item", picker.grid.children.length === 2, `cells=${picker.grid.children.length}`);
+check("a cell shows the item's icon", picker.cell.children[0]?.tag === "img");
+check("and how many you have", picker.cell.children[1]?.textContent === "3", picker.cell.children[1]?.textContent);
+
+// Hovering an enchanted item tells you what it rolled and what it is worth.
+const graded = picker.grid.children.find((cell) => enchanting.isAugmentedItem(cell.__item));
+picker.grid.fire("mouseover", { target: graded, clientX: 10, clientY: 10 });
+const tip = walk(picker.overlay.parent).find((node) => node.classList.contains("auto-enchanting-tip"));
+check("hovering shows the grade", tip.innerHTML.includes("Rare"), tip.innerHTML.slice(0, 60));
+check("hovering shows the rolled modifiers", tip.innerHTML.includes("Alpha") && tip.innerHTML.includes("Beta"));
+check("hovering shows what it disenchants into", tip.innerHTML.includes("Rare Essence"));
+
+bank.items.delete(graded.__item); // put the bank back the way section 6 wants it
+pickItem(enchantPickButton, platebody);
+
 enchantGradeSelect.value = "3"; // Epic
 addEnchantButton.fire("click");
 
@@ -682,7 +744,7 @@ bank.items.set(twin, 2); // you already own two of exactly what the enchant is a
 bank.items.set(platebody, 1);
 for (const essence of ESSENCE) bank.items.set(essence, 500);
 
-enchantItemSelect.value = platebody.id;
+pickItem(enchantPickButton, platebody);
 enchantGradeSelect.value = "2"; // Rare
 addEnchantButton.fire("click");
 const dupTask = api.settings.queue[0];
@@ -711,7 +773,7 @@ enchanting.equipment.allObjects.length = 0;
 bank.items.set(platebody, 1);
 for (const essence of ESSENCE) bank.items.set(essence, 500);
 
-enchantItemSelect.value = platebody.id;
+pickItem(enchantPickButton, platebody);
 enchantGradeSelect.value = "3"; // Epic
 addEnchantButton.fire("click");
 const resumed = api.settings.queue[0];
@@ -748,7 +810,7 @@ bank.items.set(ESSENCE[0], 60); // an enchant off a plain item costs 50 Common x
 api.settings.essenceFloor = 40;
 api.save();
 
-enchantItemSelect.value = platebody.id;
+pickItem(enchantPickButton, platebody);
 enchantGradeSelect.value = "1";
 addEnchantButton.fire("click");
 startQueueButton.fire("click");
@@ -773,8 +835,7 @@ const rerollMe = enchanting.createEnchantingItem(platebody, 2, new Set([MODS[0],
 bank.items.set(rerollMe, 1);
 bank.items.set(ESSENCE[2], 100);
 
-rerollItemSelect.value = rerollMe.id;
-rerollItemSelect.fire("change"); // the mod fills the modifier list from the item you picked
+pickItem(rerollPickButton, rerollMe); // the mod fills the modifier list from what you picked
 check("the modifier list offers what the item can roll", rerollModsSelect.children.length === MODS.length);
 
 rerollModsSelect.selectedOptions = rerollModsSelect.children.filter((o) => o.value === MODS[2].id);
@@ -797,8 +858,7 @@ check("the task is marked done", api.settings.queue[0].status === "done", api.se
 
 // Asking for more modifiers than the item can hold is refused at Add, not after 500 rerolls.
 clearButton.fire("click");
-rerollItemSelect.value = held.id;
-rerollItemSelect.fire("change");
+pickItem(rerollPickButton, held);
 rerollModsSelect.selectedOptions = rerollModsSelect.children.filter((o) =>
   [MODS[0].id, MODS[1].id, MODS[2].id].includes(o.value),
 );
